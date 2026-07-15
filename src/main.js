@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { Water } from 'three/addons/objects/Water.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -28,7 +29,7 @@ const isMobileDevice = mobileQuery || Boolean(
 );
 document.body.classList.toggle('is-mobile', isMobileDevice);
 if (isMobileDevice) {
-  document.querySelector('.instructions').innerHTML = 'Left thumb to roll · Right drag to look<br />Swipe up on the right to jump';
+  document.querySelector('.instructions').innerHTML = 'Auto-roll forward · Slide left or right to steer<br />Swipe up to jump — air jumps allowed';
 }
 
 const scene = new THREE.Scene();
@@ -435,6 +436,135 @@ addArch({ x: 0, z: -5, radius: 3.1, pillarHeight: 5.1, depth: 1.5, material: mat
 addArch({ x: 7.2, z: -12, radius: 2.0, pillarHeight: 2.8, depth: 1.35, material: materials.coral, rotationY: -0.3 });
 addArch({ x: -8.4, z: -15, radius: 2.3, pillarHeight: 3.7, depth: 1.5, material: materials.rose, rotationY: 0.42 });
 
+function makeProceduralWoodMaterial({ name, light, mid, dark, roughness, clearcoat }) {
+  const lightColor = new THREE.Color(light);
+  const midColor = new THREE.Color(mid);
+  const darkColor = new THREE.Color(dark);
+  const glslColor = (color) => `vec3(${color.r.toFixed(5)}, ${color.g.toFixed(5)}, ${color.b.toFixed(5)})`;
+  const material = new THREE.MeshPhysicalMaterial({
+    color: '#ffffff',
+    roughness,
+    metalness: 0,
+    clearcoat,
+    clearcoatRoughness: 0.22,
+    envMapIntensity: 0.92,
+  });
+  material.name = `${name} procedural wood`;
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>
+        varying vec3 vWoodPosition;
+        varying vec3 vWoodNormal;
+      `)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        vWoodPosition = position;
+        vWoodNormal = normal;
+      `);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        varying vec3 vWoodPosition;
+        varying vec3 vWoodNormal;
+
+        float woodPattern(vec3 p, vec3 n) {
+          float slowWarp = sin(p.x * 1.8 + sin(p.z * 4.2)) * 0.22;
+          float fineWarp = sin(p.x * 5.4 - p.y * 7.0 + p.z * 3.1) * 0.075;
+          vec2 heart = p.yz + vec2(sin(p.x * 1.25), cos(p.x * 1.05)) * 0.055;
+          float ringCoord = length(heart) * 35.0 + slowWarp * 5.0 + fineWarp * 2.0;
+          float endRings = 0.5 + 0.5 * sin(ringCoord);
+          float sideCoord = (p.y * 28.0 + p.z * 17.0) + slowWarp * 8.0 + sin(p.x * 3.0) * 1.2;
+          float sideGrain = 0.5 + 0.5 * sin(sideCoord);
+          sideGrain = mix(sideGrain, 0.5 + 0.5 * sin(sideCoord * 0.47 + 1.7), 0.34);
+          float endFace = smoothstep(0.58, 0.88, abs(normalize(n).x));
+          float grain = mix(sideGrain, endRings, endFace);
+          float pore = 0.5 + 0.5 * sin(p.x * 31.0 + p.y * 83.0 - p.z * 57.0);
+          return clamp(grain * 0.83 + pow(pore, 12.0) * 0.24, 0.0, 1.0);
+        }
+      `)
+      .replace('#include <color_fragment>', `#include <color_fragment>
+        float woodGrain = woodPattern(vWoodPosition, vWoodNormal);
+        vec3 woodLight = ${glslColor(lightColor)};
+        vec3 woodMid = ${glslColor(midColor)};
+        vec3 woodDark = ${glslColor(darkColor)};
+        vec3 woodColor = mix(woodLight, woodMid, smoothstep(0.18, 0.72, woodGrain));
+        woodColor = mix(woodColor, woodDark, smoothstep(0.78, 0.98, woodGrain));
+        diffuseColor.rgb *= woodColor;
+      `);
+  };
+  material.customProgramCacheKey = () => `game-dream-wood-${name}-v1`;
+  return material;
+}
+
+const woodMaterials = {
+  oak: makeProceduralWoodMaterial({
+    name: 'white-oak', light: '#d8b77c', mid: '#9a6838', dark: '#4a2a16', roughness: 0.48, clearcoat: 0.34,
+  }),
+  walnut: makeProceduralWoodMaterial({
+    name: 'black-walnut', light: '#8b5b3f', mid: '#47291f', dark: '#170d0b', roughness: 0.4, clearcoat: 0.52,
+  }),
+  cherry: makeProceduralWoodMaterial({
+    name: 'cherry', light: '#d79069', mid: '#97472f', dark: '#4d1c1c', roughness: 0.43, clearcoat: 0.46,
+  }),
+};
+
+const WOOD_BLOCK_SIZE = new THREE.Vector3(2.5, 0.54, 0.86);
+const woodBlockGeometry = new RoundedBoxGeometry(
+  WOOD_BLOCK_SIZE.x,
+  WOOD_BLOCK_SIZE.y,
+  WOOD_BLOCK_SIZE.z,
+  isMobileDevice ? 3 : 5,
+  0.065,
+);
+const floatingWoodBlocks = [];
+
+function addFloatingWoodBlock({ x, y, z, rotationY, material, phase, tower }) {
+  const mesh = shadowed(new THREE.Mesh(woodBlockGeometry, material));
+  mesh.position.set(x, y, z);
+  mesh.rotation.y = rotationY;
+  scene.add(mesh);
+
+  const rotation = { x: 0, y: Math.sin(rotationY / 2), z: 0, w: Math.cos(rotationY / 2) };
+  const body = world.createRigidBody(
+    RAPIER.RigidBodyDesc.kinematicPositionBased()
+      .setTranslation(x, y, z)
+      .setRotation(rotation),
+  );
+  world.createCollider(
+    RAPIER.ColliderDesc.cuboid(WOOD_BLOCK_SIZE.x / 2, WOOD_BLOCK_SIZE.y / 2, WOOD_BLOCK_SIZE.z / 2)
+      .setFriction(1.2)
+      .setRestitution(0.02),
+    body,
+  );
+  floatingWoodBlocks.push({ mesh, body, base: new THREE.Vector3(x, y, z), phase, tower });
+}
+
+const woodTowerDefinitions = [
+  { name: 'Oak Steps', species: 'white oak', x: -4.7, z: 1.1, baseY: 1.12, count: 3, phase: 0.1, material: woodMaterials.oak },
+  { name: 'Walnut Stack', species: 'black walnut', x: 4.35, z: -1.35, baseY: 1.38, count: 4, phase: 2.15, material: woodMaterials.walnut },
+  { name: 'Cherry Pair', species: 'cherry', x: -0.85, z: -9.2, baseY: 1.28, count: 2, phase: 4.3, material: woodMaterials.cherry },
+];
+
+for (const tower of woodTowerDefinitions) {
+  for (let level = 0; level < tower.count; level++) {
+    const crossed = level % 2 === 1;
+    addFloatingWoodBlock({
+      x: tower.x + (crossed ? 0.08 : -0.05),
+      y: tower.baseY + level * 0.59,
+      z: tower.z + (crossed ? -0.04 : 0.06),
+      rotationY: crossed ? Math.PI / 2 + 0.035 : -0.035,
+      material: tower.material,
+      phase: tower.phase,
+      tower: tower.name,
+    });
+  }
+}
+
+function updateFloatingWoodPhysics(time) {
+  for (const block of floatingWoodBlocks) {
+    const y = block.base.y + Math.sin(time * 0.82 + block.phase) * 0.14;
+    block.body.setNextKinematicTranslation({ x: block.base.x, y, z: block.base.z });
+  }
+}
+
 // Distant graphic forms keep the horizon composed without adding gameplay noise.
 for (const [x, z, h, color] of [[-15, -21, 7, materials.coral], [14, -24, 10, materials.rose], [1, -30, 5, materials.gold]]) {
   const tower = shadowed(new THREE.Mesh(new THREE.BoxGeometry(3.2, h, 3.2), color));
@@ -528,8 +658,8 @@ const ball = shadowed(new THREE.Mesh(ballGeometry, ballMaterial));
 ball.renderOrder = 2;
 scene.add(ball);
 
-const input = { forward: false, back: false, left: false, right: false, touchX: 0, touchY: 0, jumpBuffer: 0 };
-const state = { started: false, grounded: false, coyoteTime: 0, jumpCount: 0, lastKey: '', elapsed: 0, yaw: 0, pitch: 0.18, dragging: false, fps: 0 };
+const input = { forward: false, back: false, left: false, right: false, touchX: 0, jumpBuffer: 0 };
+const state = { started: false, grounded: false, coyoteTime: 0, jumpCount: 0, airJumpCount: 0, lastKey: '', elapsed: 0, yaw: 0, pitch: 0.18, dragging: false, fps: 0, touchJumpCooldown: 0 };
 const keyMap = {
   KeyW: 'forward', ArrowUp: 'forward', KeyS: 'back', ArrowDown: 'back',
   KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right',
@@ -563,32 +693,31 @@ addEventListener('keyup', (event) => {
 });
 
 const touchControl = {
-  moveId: null,
-  lookId: null,
-  moveOriginX: 0,
-  moveOriginY: 0,
-  lookStartX: 0,
-  lookStartY: 0,
-  lookLastX: 0,
-  lookLastY: 0,
-  lookStartedAt: 0,
+  id: null,
+  originX: 0,
+  originY: 0,
+  lastX: 0,
+  lastY: 0,
+  jumpTriggered: false,
 };
 
+function maybeTriggerTouchJump(clientX, clientY) {
+  if (touchControl.jumpTriggered || state.touchJumpCooldown > 0) return;
+  const swipeX = clientX - touchControl.originX;
+  const swipeY = clientY - touchControl.originY;
+  if (swipeY > -48 || Math.abs(swipeY) < Math.abs(swipeX) * 0.72) return;
+  touchControl.jumpTriggered = true;
+  performTouchJump();
+  touchJoystick.classList.add('did-jump');
+}
+
 function endTouchPointer(event) {
-  if (event.pointerId === touchControl.moveId) {
-    touchControl.moveId = null;
-    input.touchX = 0;
-    input.touchY = 0;
-    touchStick.style.transform = 'translate(0px, 0px)';
-    touchJoystick.classList.remove('is-active');
-  }
-  if (event.pointerId === touchControl.lookId) {
-    const swipeX = event.clientX - touchControl.lookStartX;
-    const swipeY = event.clientY - touchControl.lookStartY;
-    const elapsed = performance.now() - touchControl.lookStartedAt;
-    if (swipeY < -58 && Math.abs(swipeY) > Math.abs(swipeX) * 1.1 && elapsed < 700) requestJump();
-    touchControl.lookId = null;
-  }
+  if (event.pointerId !== touchControl.id) return;
+  maybeTriggerTouchJump(event.clientX, event.clientY);
+  touchControl.id = null;
+  input.touchX = 0;
+  touchStick.style.transform = 'translateX(0px)';
+  touchJoystick.classList.remove('is-active', 'did-jump');
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
 }
 
@@ -600,28 +729,23 @@ canvas.addEventListener('pointerdown', (event) => {
     // Synthetic tests and a few embedded browsers can reject pointer capture;
     // the gesture still works because events remain bound to the canvas.
   }
-  if (isMobileDevice && event.pointerType !== 'mouse') {
+  if (isMobileDevice) {
     event.preventDefault();
-    if (event.clientX < innerWidth * 0.48 && touchControl.moveId === null) {
-      touchControl.moveId = event.pointerId;
-      touchControl.moveOriginX = event.clientX;
-      touchControl.moveOriginY = event.clientY;
-      touchJoystick.style.left = `${event.clientX}px`;
-      touchJoystick.style.top = `${event.clientY}px`;
-      touchJoystick.classList.add('is-active');
-    } else if (touchControl.lookId === null) {
-      touchControl.lookId = event.pointerId;
-      touchControl.lookStartX = touchControl.lookLastX = event.clientX;
-      touchControl.lookStartY = touchControl.lookLastY = event.clientY;
-      touchControl.lookStartedAt = performance.now();
-    }
+    if (touchControl.id !== null) return;
+    touchControl.id = event.pointerId;
+    touchControl.originX = touchControl.lastX = event.clientX;
+    touchControl.originY = touchControl.lastY = event.clientY;
+    touchControl.jumpTriggered = false;
+    touchJoystick.style.left = `${THREE.MathUtils.clamp(event.clientX, 88, innerWidth - 88)}px`;
+    touchJoystick.style.top = `${THREE.MathUtils.clamp(event.clientY, 46, innerHeight - 46)}px`;
+    touchJoystick.classList.add('is-active');
     return;
   }
   state.dragging = true;
 });
 
 canvas.addEventListener('pointerup', (event) => {
-  if (isMobileDevice && event.pointerType !== 'mouse') endTouchPointer(event);
+  if (isMobileDevice) endTouchPointer(event);
   else {
     state.dragging = false;
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
@@ -630,27 +754,13 @@ canvas.addEventListener('pointerup', (event) => {
 canvas.addEventListener('pointercancel', endTouchPointer);
 
 canvas.addEventListener('pointermove', (event) => {
-  if (event.pointerId === touchControl.moveId) {
-    const radius = 46;
-    let dx = event.clientX - touchControl.moveOriginX;
-    let dy = event.clientY - touchControl.moveOriginY;
-    const length = Math.hypot(dx, dy);
-    if (length > radius) {
-      dx = (dx / length) * radius;
-      dy = (dy / length) * radius;
-    }
-    input.touchX = dx / radius;
-    input.touchY = -dy / radius;
-    touchStick.style.transform = `translate(${dx}px, ${dy}px)`;
-    return;
-  }
-  if (event.pointerId === touchControl.lookId) {
-    const dx = event.clientX - touchControl.lookLastX;
-    const dy = event.clientY - touchControl.lookLastY;
-    touchControl.lookLastX = event.clientX;
-    touchControl.lookLastY = event.clientY;
-    state.yaw -= dx * 0.006;
-    state.pitch = THREE.MathUtils.clamp(state.pitch - dy * 0.0045, 0.06, 0.7);
+  if (isMobileDevice && event.pointerId === touchControl.id) {
+    touchControl.lastX = event.clientX;
+    touchControl.lastY = event.clientY;
+    const dx = THREE.MathUtils.clamp(event.clientX - touchControl.originX, -64, 64);
+    input.touchX = dx / 64;
+    touchStick.style.transform = `translateX(${dx}px)`;
+    maybeTriggerTouchJump(event.clientX, event.clientY);
     return;
   }
   if (!state.dragging) return;
@@ -668,13 +778,24 @@ function resetPlayer() {
   playerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
   playerBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
   playerBody.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
-  state.lastImpact = 0;
+  state.touchJumpCooldown = 0;
 }
 
 function performJump() {
   playerBody.applyImpulse({ x: 0, y: playerBody.mass() * 9.2, z: 0 }, true);
   state.jumpCount += 1;
   state.coyoteTime = 0;
+  input.jumpBuffer = 0;
+}
+
+function performTouchJump() {
+  const velocity = playerBody.linvel();
+  const wasAirborne = !state.grounded;
+  playerBody.setLinvel({ x: velocity.x, y: 9.2, z: velocity.z }, true);
+  state.jumpCount += 1;
+  if (wasAirborne) state.airJumpCount += 1;
+  state.coyoteTime = 0;
+  state.touchJumpCooldown = 0.12;
   input.jumpBuffer = 0;
 }
 
@@ -706,12 +827,15 @@ function fixedUpdate(dt) {
     forward.set(-Math.sin(state.yaw), 0, -Math.cos(state.yaw));
     right.set(-forward.z, 0, forward.x);
     moveDirection.set(0, 0, 0);
-    if (input.forward) moveDirection.add(forward);
-    if (input.back) moveDirection.sub(forward);
-    if (input.right) moveDirection.add(right);
-    if (input.left) moveDirection.sub(right);
-    moveDirection.addScaledVector(forward, input.touchY);
-    moveDirection.addScaledVector(right, input.touchX);
+    if (isMobileDevice) {
+      moveDirection.add(forward);
+      moveDirection.addScaledVector(right, input.touchX);
+    } else {
+      if (input.forward) moveDirection.add(forward);
+      if (input.back) moveDirection.sub(forward);
+      if (input.right) moveDirection.add(right);
+      if (input.left) moveDirection.sub(right);
+    }
 
     if (moveDirection.lengthSq() > 0) {
       const moveStrength = Math.min(1, moveDirection.length());
@@ -728,7 +852,9 @@ function fixedUpdate(dt) {
     }
   }
   input.jumpBuffer = Math.max(0, input.jumpBuffer - dt);
+  state.touchJumpCooldown = Math.max(0, state.touchJumpCooldown - dt);
 
+  updateFloatingWoodPhysics(state.elapsed);
   world.step();
 
   const next = playerBody.translation();
@@ -745,6 +871,10 @@ function updateVisuals(dt) {
   const rotation = playerBody.rotation();
   ball.position.set(position.x, position.y, position.z);
   ball.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
+  for (const block of floatingWoodBlocks) {
+    const blockPosition = block.body.translation();
+    block.mesh.position.set(blockPosition.x, blockPosition.y, blockPosition.z);
+  }
 
   // Aim above the ball so it lives in the lower third and tall architecture remains visible.
   cameraTarget.set(position.x, position.y + 2.1, position.z);
@@ -803,6 +933,7 @@ composer.setPixelRatio(qualityRatio);
 composer.addPass(new RenderPass(scene, camera));
 const gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
 const gtaoSamples = isMobileDevice ? 4 : 8;
+gtao.enabled = !isMobileDevice;
 gtao.blendIntensity = isMobileDevice ? 0.38 : 0.48;
 gtao.updateGtaoMaterial({ radius: 0.22, distanceExponent: 1.8, thickness: 1.0, scale: 0.85, samples: gtaoSamples });
 gtao.updatePdMaterial({ radius: isMobileDevice ? 2 : 3, rings: isMobileDevice ? 1 : 2, samples: gtaoSamples, lumaPhi: 10, depthPhi: 2, normalPhi: 3 });
@@ -815,7 +946,8 @@ function render(dt = 1 / 60) {
   updateVisuals(dt);
   poolWater.material.uniforms.time.value += dt * 0.42;
   gradePass.uniforms.time.value = performance.now();
-  composer.render(dt);
+  if (isMobileDevice) renderer.render(scene, camera);
+  else composer.render(dt);
 }
 
 let accumulator = 0;
@@ -864,15 +996,25 @@ window.render_game_to_text = () => {
       coyoteTime: +state.coyoteTime.toFixed(3),
       jumpBuffer: +input.jumpBuffer.toFixed(3),
       jumpCount: state.jumpCount,
+      airJumpCount: state.airJumpCount,
       horizontalSpeed: +Math.hypot(v.x, v.z).toFixed(2),
     },
-    camera: { yaw: +state.yaw.toFixed(2), pitch: +state.pitch.toFixed(2) },
-    performance: { fps: state.fps, mobileMode: isMobileDevice, pixelRatio: qualityRatio, antialiasSamples: isMobileDevice ? 0 : 4, shadowMap: isMobileDevice ? 1024 : 2048, reflectionMap: isMobileDevice ? 384 : 768, gtaoSamples },
-    controls: isMobileDevice ? 'left thumb roll, right drag look, right-side upward swipe jump, Reset button' : 'WASD/arrows roll, Space jump, drag look, R reset, F fullscreen',
+    camera: {
+      yaw: +state.yaw.toFixed(2),
+      pitch: +state.pitch.toFixed(2),
+      position: { x: +camera.position.x.toFixed(2), y: +camera.position.y.toFixed(2), z: +camera.position.z.toFixed(2) },
+      target: { x: +smoothTarget.x.toFixed(2), y: +smoothTarget.y.toFixed(2), z: +smoothTarget.z.toFixed(2) },
+    },
+    performance: { fps: state.fps, mobileMode: isMobileDevice, pixelRatio: qualityRatio, antialiasSamples: isMobileDevice ? 0 : 4, shadowMap: isMobileDevice ? 1024 : 2048, reflectionMap: isMobileDevice ? 384 : 768, postProcessing: !isMobileDevice, gtaoEnabled: gtao.enabled, gtaoSamples: gtao.enabled ? gtaoSamples : 0 },
+    controls: isMobileDevice ? 'automatic forward roll, one-finger horizontal slide steering, upward swipe jump with repeatable air jumps, automatic camera, Reset button' : 'WASD/arrows roll, Space jump, drag look, R reset, F fullscreen',
     pools: [
       { shape: 'rectangle', x: RECT_POOL.x, z: RECT_POOL.z, waterY: RECT_POOL.waterY },
       { shape: 'round', x: ROUND_POOL.x, z: ROUND_POOL.z, waterY: ROUND_POOL.waterY },
     ],
+    floatingWoodTowers: woodTowerDefinitions.map(({ name, species, x, z, count }) => {
+      const baseBlock = floatingWoodBlocks.find((block) => block.tower === name);
+      return { name, species, x, z, blocks: count, currentBaseY: +baseBlock.body.translation().y.toFixed(2) };
+    }),
     environment: { playerMaterial: 'rigid texture-free procedural PBR marble', sky: 'procedural Preetham', sunElevation: skySettings.elevation, water: 'planar reflective', waves: 'three small geometric wave bands, max amplitude 0.046' },
     landmarks: ['gold arch at (0, -5)', 'rose/coral stairs near (-7, -5)', 'coral arch at (7, -12)'],
   });
