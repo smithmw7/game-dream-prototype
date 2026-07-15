@@ -39,7 +39,7 @@ camera.position.set(6, 5, 11);
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
 renderer.setSize(innerWidth, innerHeight);
-const qualityRatio = Math.min(devicePixelRatio, isMobileDevice ? 1 : 1.25);
+const qualityRatio = Math.min(devicePixelRatio, isMobileDevice ? 1 : 1.75);
 renderer.setPixelRatio(qualityRatio);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -455,59 +455,81 @@ const playerCollider = world.createCollider(
   playerBody
 );
 
-const ballUniforms = {
-  time: { value: 0 },
-  squash: { value: 0 },
-  speed: { value: 0 },
-};
-
 const ballMaterial = new THREE.MeshPhysicalMaterial({
-  color: '#ffd5df',
-  roughness: 0.09,
+  color: '#fff8ed',
+  roughness: 0.14,
   metalness: 0,
-  transmission: 0.48,
-  transparent: true,
-  opacity: 0.88,
-  thickness: 1.1,
-  ior: 1.43,
+  ior: 1.48,
+  reflectivity: 0.72,
   clearcoat: 1,
-  clearcoatRoughness: 0.06,
-  sheen: 0.22,
-  sheenColor: new THREE.Color('#ff91b6'),
-  envMapIntensity: 1.35,
-  attenuationColor: new THREE.Color('#ff8fb2'),
-  attenuationDistance: 2.8,
+  clearcoatRoughness: 0.035,
+  sheen: 0.08,
+  sheenColor: new THREE.Color('#ffd5ca'),
+  envMapIntensity: 1.7,
 });
 
 ballMaterial.onBeforeCompile = (shader) => {
-  Object.assign(shader.uniforms, ballUniforms);
   shader.vertexShader = shader.vertexShader
-    .replace('#include <common>', `#include <common>\nuniform float time;\nuniform float squash;\nuniform float speed;`)
+    .replace('#include <common>', `#include <common>
+      varying vec3 vMarblePosition;
+      varying vec3 vMarbleRayDirection;
+    `)
     .replace('#include <begin_vertex>', `
       vec3 transformed = vec3(position);
-      float expand = 1.0 + squash * 0.34;
-      transformed.xz *= expand;
-      transformed.y *= 1.0 - squash * 0.42;
-      float wobble = sin(position.y * 7.0 + time * 7.0) * sin(position.x * 6.0 - time * 4.0);
-      transformed += normal * wobble * (0.003 + speed * 0.0007);
+      vMarblePosition = position / ${PLAYER_RADIUS.toFixed(2)};
+      vec3 marbleCameraOffset = cameraPosition - vec3(modelMatrix[3]);
+      vec3 marbleCameraObject = transpose(mat3(modelMatrix)) * marbleCameraOffset / ${PLAYER_RADIUS.toFixed(2)};
+      vMarbleRayDirection = normalize(vMarblePosition - marbleCameraObject);
+    `);
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `#include <common>
+      varying vec3 vMarblePosition;
+      varying vec3 vMarbleRayDirection;
+
+      float marbleSlice(vec3 p) {
+        float broadWarp = sin(p.x * 3.1 + p.z * 1.8) + 0.52 * sin(p.y * 5.7 - p.x * 2.2);
+        float fineWarp = 0.24 * sin(dot(p, vec3(7.3, -5.1, 6.4)) + sin(p.z * 4.0));
+        float sweep = p.y * 3.15 + p.x * 1.35 - p.z * 0.75 + broadWarp * 1.55 + fineWarp;
+        float aa = fwidth(sweep);
+        float primary = 1.0 - smoothstep(0.07 + aa, 0.34 + aa, abs(sin(sweep)));
+        float hairline = 1.0 - smoothstep(0.018 + aa, 0.11 + aa, abs(sin(sweep * 2.11 + 1.35)));
+        return clamp(primary * 0.88 + hairline * 0.42, 0.0, 1.0);
+      }
+
+      vec3 marchMarble(vec3 rayOrigin, vec3 rayDirection) {
+        vec3 p = normalize(rayOrigin);
+        float volume = 0.0;
+        float weight = 0.0;
+        for (int i = 0; i < 4; i++) {
+          float fade = 1.0 - float(i) / 5.0;
+          volume += marbleSlice(p) * fade;
+          weight += fade;
+          p += rayDirection * 0.18;
+        }
+        volume /= weight;
+        float surface = marbleSlice(normalize(rayOrigin) * 1.15);
+        vec3 ivory = vec3(0.98, 0.91, 0.80);
+        vec3 blush = vec3(0.90, 0.40, 0.42);
+        vec3 wine = vec3(0.24, 0.035, 0.075);
+        vec3 color = mix(ivory, blush, smoothstep(0.08, 0.48, volume) * 0.58);
+        color = mix(color, wine, smoothstep(0.20, 0.78, surface) * 0.86);
+        return color;
+      }
+    `)
+    .replace('#include <color_fragment>', `#include <color_fragment>
+      diffuseColor.rgb *= marchMarble(vMarblePosition, normalize(vMarbleRayDirection));
     `);
 };
+ballMaterial.customProgramCacheKey = () => 'game-dream-hard-marble-v1';
 
-const ball = shadowed(new THREE.Mesh(new THREE.IcosahedronGeometry(PLAYER_RADIUS, 6), ballMaterial));
+const ballSegments = isMobileDevice ? 64 : 128;
+const ballGeometry = new THREE.SphereGeometry(PLAYER_RADIUS, ballSegments, ballSegments / 2);
+const ball = shadowed(new THREE.Mesh(ballGeometry, ballMaterial));
 ball.renderOrder = 2;
 scene.add(ball);
 
-const innerGroup = new THREE.Group();
-ball.add(innerGroup);
-const coreMaterial = new THREE.MeshPhysicalMaterial({ color: '#ffb3cb', roughness: 0.24, transmission: 0.2, thickness: 0.5, opacity: 0.38, transparent: true });
-for (const p of [[.22, .11, .05], [-.16, -.18, .12], [.03, .2, -.2]]) {
-  const bead = new THREE.Mesh(new THREE.SphereGeometry(0.105, 24, 18), coreMaterial);
-  bead.position.set(...p);
-  innerGroup.add(bead);
-}
-
 const input = { forward: false, back: false, left: false, right: false, touchX: 0, touchY: 0, jumpBuffer: 0 };
-const state = { started: false, grounded: false, coyoteTime: 0, jumpCount: 0, lastKey: '', elapsed: 0, lastImpact: 0, yaw: 0, pitch: 0.18, dragging: false, fps: 0 };
+const state = { started: false, grounded: false, coyoteTime: 0, jumpCount: 0, lastKey: '', elapsed: 0, yaw: 0, pitch: 0.18, dragging: false, fps: 0 };
 const keyMap = {
   KeyW: 'forward', ArrowUp: 'forward', KeyS: 'back', ArrowDown: 'back',
   KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right',
@@ -651,7 +673,6 @@ function resetPlayer() {
 
 function performJump() {
   playerBody.applyImpulse({ x: 0, y: playerBody.mass() * 9.2, z: 0 }, true);
-  state.lastImpact = -0.24;
   state.jumpCount += 1;
   state.coyoteTime = 0;
   input.jumpBuffer = 0;
@@ -670,7 +691,6 @@ resetButton.addEventListener('click', resetPlayer);
 const moveDirection = new THREE.Vector3();
 const forward = new THREE.Vector3();
 const right = new THREE.Vector3();
-let wasGrounded = false;
 
 function fixedUpdate(dt) {
   state.elapsed += dt;
@@ -709,12 +729,6 @@ function fixedUpdate(dt) {
   }
   input.jumpBuffer = Math.max(0, input.jumpBuffer - dt);
 
-  if (state.grounded && !wasGrounded && velocity.y < -1.4) {
-    state.lastImpact = Math.min(0.65, Math.abs(velocity.y) * 0.075);
-  }
-  wasGrounded = state.grounded;
-  state.lastImpact *= Math.exp(-dt * 8.5);
-
   world.step();
 
   const next = playerBody.translation();
@@ -729,14 +743,8 @@ const smoothTarget = new THREE.Vector3(0, 1.3, 5.5);
 function updateVisuals(dt) {
   const position = playerBody.translation();
   const rotation = playerBody.rotation();
-  const velocity = playerBody.linvel();
   ball.position.set(position.x, position.y, position.z);
-  innerGroup.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
-
-  const speed = Math.hypot(velocity.x, velocity.z);
-  ballUniforms.time.value = state.elapsed;
-  ballUniforms.speed.value = speed;
-  ballUniforms.squash.value = state.lastImpact;
+  ball.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
 
   // Aim above the ball so it lives in the lower third and tall architecture remains visible.
   cameraTarget.set(position.x, position.y + 2.1, position.z);
@@ -784,7 +792,13 @@ const gradeShader = {
   `,
 };
 
-const composer = new EffectComposer(renderer);
+const composerTarget = new THREE.WebGLRenderTarget(1, 1, {
+  type: THREE.HalfFloatType,
+  depthBuffer: true,
+  stencilBuffer: false,
+  samples: isMobileDevice ? 0 : 4,
+});
+const composer = new EffectComposer(renderer, composerTarget);
 composer.setPixelRatio(qualityRatio);
 composer.addPass(new RenderPass(scene, camera));
 const gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
@@ -853,13 +867,13 @@ window.render_game_to_text = () => {
       horizontalSpeed: +Math.hypot(v.x, v.z).toFixed(2),
     },
     camera: { yaw: +state.yaw.toFixed(2), pitch: +state.pitch.toFixed(2) },
-    performance: { fps: state.fps, mobileMode: isMobileDevice, pixelRatio: qualityRatio, shadowMap: isMobileDevice ? 1024 : 2048, reflectionMap: isMobileDevice ? 384 : 768, gtaoSamples },
+    performance: { fps: state.fps, mobileMode: isMobileDevice, pixelRatio: qualityRatio, antialiasSamples: isMobileDevice ? 0 : 4, shadowMap: isMobileDevice ? 1024 : 2048, reflectionMap: isMobileDevice ? 384 : 768, gtaoSamples },
     controls: isMobileDevice ? 'left thumb roll, right drag look, right-side upward swipe jump, Reset button' : 'WASD/arrows roll, Space jump, drag look, R reset, F fullscreen',
     pools: [
       { shape: 'rectangle', x: RECT_POOL.x, z: RECT_POOL.z, waterY: RECT_POOL.waterY },
       { shape: 'round', x: ROUND_POOL.x, z: ROUND_POOL.z, waterY: ROUND_POOL.waterY },
     ],
-    environment: { sky: 'procedural Preetham', sunElevation: skySettings.elevation, water: 'planar reflective', waves: 'three small geometric wave bands, max amplitude 0.046' },
+    environment: { playerMaterial: 'rigid texture-free procedural PBR marble', sky: 'procedural Preetham', sunElevation: skySettings.elevation, water: 'planar reflective', waves: 'three small geometric wave bands, max amplitude 0.046' },
     landmarks: ['gold arch at (0, -5)', 'rose/coral stairs near (-7, -5)', 'coral arch at (7, -12)'],
   });
 };

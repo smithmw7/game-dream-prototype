@@ -2,9 +2,11 @@
 
 A surreal third-person rolling-ball playground built with Three.js and Rapier.
 
+[Play Game Dream](https://smithmw7.github.io/game-dream/)
+
 ## Features
 
-- Glossy translucent soft-body-inspired player ball
+- Rigid glossy marble with a texture-free volumetric PBR shader
 - Physics-driven rolling and higher jumping
 - Spring-arm third-person camera with obstruction handling
 - Procedural atmospheric sky and synchronized sunlight
@@ -48,4 +50,3 @@ npm run build
 - [Three.js](https://threejs.org/)
 - [Rapier](https://rapier.rs/)
 - [Vite](https://vite.dev/)
-
