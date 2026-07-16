@@ -48,6 +48,7 @@ const touchStick = document.querySelector('#touch-stick');
 const pageQuery = new URLSearchParams(location.search);
 const mobileQuery = pageQuery.has('mobile');
 const debugRaceQuery = pageQuery.has('debug');
+const requestedDebugDistance = Number(pageQuery.get('distance'));
 const isMobileDevice = mobileQuery || Boolean(
   navigator.userAgentData?.mobile ||
   matchMedia('(pointer: coarse)').matches ||
@@ -601,8 +602,8 @@ const RACE_LENGTH = 6500;
 const RACE_HALF_WIDTH = 6.2;
 const TRACK_STEP = isMobileDevice ? 6 : 4;
 const TRACK_LOOPS = [
-  { start: 2200, length: 176, radius: 28, name: 'Sun Loop' },
-  { start: 4920, length: 208, radius: 33, name: 'Neon Loop' },
+  { start: 2200, length: 176, radius: 28, xOffset: 18, name: 'Sun Loop' },
+  { start: 4920, length: 208, radius: 33, xOffset: -22, name: 'Neon Loop' },
 ];
 const COURSE_SECTIONS = [
   { name: 'Sky Launch', start: 0, end: 350, speed: 34, coinSpacing: 15, hazardSpacing: 170, pattern: 'warmup', intensity: 1 },
@@ -661,24 +662,38 @@ function createRaceTrackSamples() {
     let right;
     let up;
     let bank = 0;
+    let loopProgress = null;
+    let loopXOffset = 0;
 
     if (loop) {
       if (!loopStates.has(loop.start)) {
         const yaw = trackTurnAt(loop.start);
         const loopForward = new THREE.Vector3(Math.sin(yaw), 0, -Math.cos(yaw)).normalize();
-        loopStates.set(loop.start, { start: cursor.clone(), forward: loopForward });
+        const loopRight = new THREE.Vector3().crossVectors(loopForward, worldUp).normalize();
+        loopStates.set(loop.start, { start: cursor.clone(), forward: loopForward, right: loopRight });
       }
       const loopState = loopStates.get(loop.start);
       const t = THREE.MathUtils.clamp((distance - loop.start) / loop.length, 0, 1);
+      loopProgress = t;
       const angle = -Math.PI / 2 + t * Math.PI * 2;
+      const xEnvelope = Math.sin(Math.PI * t);
+      const xOffset = loop.xOffset * xEnvelope * xEnvelope;
+      loopXOffset = xOffset;
       center = loopState.start.clone()
         .addScaledVector(worldUp, loop.radius + Math.sin(angle) * loop.radius)
-        .addScaledVector(loopState.forward, Math.cos(angle) * loop.radius);
+        .addScaledVector(loopState.forward, Math.cos(angle) * loop.radius)
+        .addScaledVector(loopState.right, xOffset);
+      const xDerivative = loop.xOffset * Math.PI * Math.sin(Math.PI * 2 * t);
       tangent = worldUp.clone().multiplyScalar(Math.cos(angle))
-        .addScaledVector(loopState.forward, -Math.sin(angle)).normalize();
-      right = new THREE.Vector3().crossVectors(tangent, worldUp);
-      if (right.lengthSq() < 0.001) right.set(Math.cos(trackTurnAt(loop.start)), 0, Math.sin(trackTurnAt(loop.start)));
-      right.normalize();
+        .addScaledVector(loopState.forward, -Math.sin(angle))
+        .multiplyScalar(loop.radius * Math.PI * 2)
+        .addScaledVector(loopState.right, xDerivative)
+        .normalize();
+      // Preserve the same local X axis through the entire rotation. Rebuilding
+      // it from world-up flips its sign after the apex and twists the road.
+      right = loopState.right.clone()
+        .addScaledVector(tangent, -loopState.right.dot(tangent))
+        .normalize();
       up = new THREE.Vector3().crossVectors(right, tangent).normalize();
       if (t >= 0.999) cursor.copy(loopState.start);
     } else {
@@ -687,13 +702,19 @@ function createRaceTrackSamples() {
       right = new THREE.Vector3(Math.cos(yaw), 0, Math.sin(yaw)).normalize();
       up = new THREE.Vector3().crossVectors(right, tangent).normalize();
       const section = raceSectionAtDistance(distance);
-      bank = -Math.sin(distance / 104) * (0.08 + section.intensity * 0.035);
+      const closestLoopSeam = TRACK_LOOPS.reduce((closest, entry) => Math.min(
+        closest,
+        Math.abs(distance - entry.start),
+        Math.abs(distance - (entry.start + entry.length)),
+      ), Infinity);
+      const loopBankBlend = THREE.MathUtils.smoothstep(closestLoopSeam, 0, 64);
+      bank = -Math.sin(distance / 104) * (0.08 + section.intensity * 0.035) * loopBankBlend;
       right.applyAxisAngle(tangent, bank).normalize();
       up.crossVectors(right, tangent).normalize();
       center = cursor.clone();
     }
 
-    samples.push({ distance, center, tangent, right, up, bank, loop: loop?.name || null });
+    samples.push({ distance, center, tangent, right, up, bank, loop: loop?.name || null, loopProgress, loopXOffset });
 
     const nextDistance = Math.min(RACE_LENGTH, distance + TRACK_STEP);
     const inLoop = TRACK_LOOPS.some((entry) => nextDistance > entry.start && nextDistance <= entry.start + entry.length);
@@ -708,7 +729,7 @@ const raceTrackSamples = createRaceTrackSamples();
 const raceBasisForward = new THREE.Vector3();
 const raceFrame = {
   center: new THREE.Vector3(), tangent: new THREE.Vector3(), right: new THREE.Vector3(), up: new THREE.Vector3(),
-  bank: 0, loop: null,
+  bank: 0, loop: null, loopProgress: null, loopXOffset: 0,
 };
 
 function makeRaceBasis(frame, target = new THREE.Matrix4()) {
@@ -730,6 +751,10 @@ function getRaceFrame(distance, target = raceFrame) {
   target.up.copy(a.up).lerp(b.up, alpha).normalize();
   target.bank = THREE.MathUtils.lerp(a.bank, b.bank, alpha);
   target.loop = alpha < 0.5 ? a.loop : b.loop;
+  target.loopProgress = a.loopProgress === null || b.loopProgress === null
+    ? (alpha < 0.5 ? a.loopProgress : b.loopProgress)
+    : THREE.MathUtils.lerp(a.loopProgress, b.loopProgress, alpha);
+  target.loopXOffset = THREE.MathUtils.lerp(a.loopXOffset, b.loopXOffset, alpha);
   return target;
 }
 
@@ -1611,7 +1636,12 @@ function startRace() {
     checkpointIndex: 0, lastCheckpointDistance: 4,
     hitCooldown: 0, toastTimer: 0, shieldPickups: 0, shieldPops: 0, coinCrashes: 0,
   });
-  Object.assign(raceMotor, { distance: 4, speed: 0, lateral: 0, lateralVelocity: 0, jumpHeight: 0, jumpVelocity: 0, grounded: true, roll: 0 });
+  const debugStartDistance = debugRaceQuery && Number.isFinite(requestedDebugDistance)
+    ? THREE.MathUtils.clamp(requestedDebugDistance, 4, RACE_LENGTH - 1)
+    : 4;
+  Object.assign(raceMotor, { distance: debugStartDistance, speed: 0, lateral: 0, lateralVelocity: 0, jumpHeight: 0, jumpVelocity: 0, grounded: true, roll: 0 });
+  race.checkpointIndex = RACE_CHECKPOINT_DISTANCES.filter((distance) => distance <= debugStartDistance).length;
+  race.lastCheckpointDistance = race.checkpointIndex ? RACE_CHECKPOINT_DISTANCES[race.checkpointIndex - 1] + 2.5 : 4;
   state.mode = 'race-countdown';
   state.started = true;
   state.yaw = 0;
@@ -2245,7 +2275,7 @@ window.render_game_to_text = () => {
   const p = playerBody.translation();
   const v = playerBody.linvel();
   const currentRaceFrame = getRaceFrame(raceMotor.distance, {
-    center: new THREE.Vector3(), tangent: new THREE.Vector3(), right: new THREE.Vector3(), up: new THREE.Vector3(), bank: 0, loop: null,
+    center: new THREE.Vector3(), tangent: new THREE.Vector3(), right: new THREE.Vector3(), up: new THREE.Vector3(), bank: 0, loop: null, loopProgress: null, loopXOffset: 0,
   });
   const currentSection = raceSectionAtDistance(raceMotor.distance);
   return JSON.stringify({
@@ -2283,6 +2313,8 @@ window.render_game_to_text = () => {
       jumpHeight: +raceMotor.jumpHeight.toFixed(2),
       jumpVelocity: +raceMotor.jumpVelocity.toFixed(2),
       trackLoop: currentRaceFrame.loop,
+      loopProgress: currentRaceFrame.loopProgress === null ? null : +currentRaceFrame.loopProgress.toFixed(3),
+      loopXOffset: +currentRaceFrame.loopXOffset.toFixed(2),
       physicsModel: 'deterministic kinematic arcade motor; no race-surface rigid-body bounce',
       elapsed: +race.elapsed.toFixed(3),
       formattedTime: formatTime(Math.max(race.elapsed, 0.0001)),
