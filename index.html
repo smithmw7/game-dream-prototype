@@ -37,10 +37,10 @@
         <div class="panel-card drive-card">
           <p class="eyebrow">ENDLESS PROTOCOL</p>
           <h2>Neon<br />Nightshift</h2>
-          <p class="panel-copy">Thread three fixed lanes through a rain-black cyber city. Swipe around roadblocks, harvest data shards, and chase the curved horizon until you crash.</p>
+          <p class="panel-copy">Thread three fixed lanes through a rain-black cyber city, then launch into neon canals as your coupe transforms into a speedboat in midair. Dodge roadblocks and buoys, harvest shards and floating orbs, and chase the curved horizon until you crash.</p>
           <div class="record-grid">
             <div><span>BEST DISTANCE</span><strong id="drive-best-distance">0 m</strong></div>
-            <div><span>BEST SHARDS</span><strong id="drive-best-shards">0</strong></div>
+            <div><span>BEST PICKUPS</span><strong id="drive-best-shards">0</strong></div>
           </div>
           <p class="control-copy">SWIPE OR ARROWS · THREE FIXED LANES · NO BRAKES</p>
           <div class="panel-actions">
@@ -56,7 +56,7 @@
           <h2>Run<br />terminated.</h2>
           <div class="finish-time" id="drive-finish-distance">0 m</div>
           <div class="record-grid">
-            <div><span>DATA SHARDS</span><strong id="drive-finish-shards">0</strong></div>
+            <div><span>PICKUPS</span><strong id="drive-finish-shards">0</strong></div>
             <div><span>BEST DISTANCE</span><strong id="drive-finish-best">0 m</strong></div>
           </div>
           <p id="drive-finish-record" class="new-record">RUN SAVED</p>
@@ -113,9 +113,9 @@
       </aside>
 
       <aside id="drive-hud" class="race-hud drive-hud is-hidden" aria-label="Drive status">
-        <div class="hud-course"><span>DRIVE · NEON NIGHTSHIFT</span><strong>ENDLESS CITY</strong></div>
+        <div class="hud-course"><span id="drive-hud-protocol">DRIVE · NEON NIGHTSHIFT</span><strong id="drive-hud-section">ENDLESS CITY</strong></div>
         <div class="hud-stat"><span>DISTANCE</span><strong id="drive-hud-distance">0 m</strong></div>
-        <div class="hud-stat"><span>SHARDS</span><strong id="drive-hud-shards">0</strong></div>
+        <div class="hud-stat"><span id="drive-hud-pickup-label">PICKUPS</span><strong id="drive-hud-shards">0</strong></div>
         <div class="hud-stat"><span>LANE</span><strong id="drive-hud-lane">2 / 3</strong></div>
         <div class="hud-shield is-active"><span class="shield-dot"></span><span id="drive-hud-speed">0 KM/H</span></div>
         <div class="speed-track"><i id="drive-speed-fill"></i></div>

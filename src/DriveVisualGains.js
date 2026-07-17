@@ -92,6 +92,7 @@ export class DriveVisualGains {
     this.pulseCursor = 0;
     this.eventCounts = { collectBursts: 0, roadPulses: 0, crashBursts: 0, shockwaves: 0 };
     this.boost = { value: 0 };
+    this.surface = 'road';
 
     this.createSpeedStreaks();
     this.createBurstPool();
@@ -360,9 +361,23 @@ export class DriveVisualGains {
     this.eventCounts.shockwaves += 1;
   }
 
+  setSurface(surface = 'road') {
+    this.surface = ['road', 'water', 'air'].includes(surface) ? surface : 'road';
+    const roadVisible = this.surface === 'road';
+    this.contactShadow.visible = roadVisible;
+    for (const trail of this.reflectionTrails) trail.visible = roadVisible;
+    if (!roadVisible) {
+      this.roadPulses.forEach((pulse) => {
+        pulse.timeline?.kill();
+        pulse.mesh.visible = false;
+        pulse.material.opacity = 0;
+      });
+    }
+  }
+
   collect(origin) {
     this.triggerBurst('collect', origin);
-    this.triggerRoadPulse();
+    if (this.surface === 'road') this.triggerRoadPulse();
     this.eventCounts.collectBursts += 1;
   }
 
@@ -423,6 +438,7 @@ export class DriveVisualGains {
       effect.material.opacity = 0;
     });
     for (const setOpacity of this.trailSetters) setOpacity(0);
+    this.setSurface('road');
   }
 
   snapshot() {
@@ -430,6 +446,7 @@ export class DriveVisualGains {
       pooledSpeedStreaks: this.streakCount,
       pooledBurstParticles: this.burstSlotCount * this.particlesPerBurst,
       mobileBudget: this.isMobile,
+      surface: this.surface,
       ...this.eventCounts,
     };
   }

@@ -45,6 +45,9 @@ const driveHudDistance = document.querySelector('#drive-hud-distance');
 const driveHudShards = document.querySelector('#drive-hud-shards');
 const driveHudLane = document.querySelector('#drive-hud-lane');
 const driveHudSpeed = document.querySelector('#drive-hud-speed');
+const driveHudProtocol = document.querySelector('#drive-hud-protocol');
+const driveHudSection = document.querySelector('#drive-hud-section');
+const driveHudPickupLabel = document.querySelector('#drive-hud-pickup-label');
 const driveSpeedFill = document.querySelector('#drive-speed-fill');
 const raceBriefing = document.querySelector('#race-briefing');
 const raceStartButton = document.querySelector('#race-start-button');
@@ -78,6 +81,8 @@ const pageQuery = new URLSearchParams(location.search);
 const mobileQuery = pageQuery.has('mobile');
 const debugRaceQuery = pageQuery.has('debug');
 const requestedDebugDistance = Number(pageQuery.get('distance'));
+const requestedDriveDistance = Number(pageQuery.get('driveDistance'));
+const debugFreezeQuery = debugRaceQuery && pageQuery.has('freeze');
 const isMobileDevice = mobileQuery || Boolean(
   navigator.userAgentData?.mobile ||
   matchMedia('(pointer: coarse)').matches ||
@@ -1460,8 +1465,9 @@ const state = {
 };
 const driveMode = new DriveMode(scene, {
   isMobile: isMobileDevice,
-  onCollect: () => handleDriveCollect(),
+  onCollect: (_driveState, kind) => handleDriveCollect(kind),
   onCrash: () => finishDrive(),
+  onSectionChange: (section) => handleDriveSectionChange(section),
   prefersReducedMotion: () => motion.reducedMotion,
 });
 const keyMap = {
@@ -1574,6 +1580,10 @@ function applyModeLook(profile = 'free') {
   raceSkyDome.visible = racing;
   raceMoon.visible = racing;
   sky.visible = !racing && !driving;
+  // Three.js Water uses a nested reflection render. Only one reflective Water
+  // surface may be visible at a time or separate reflectors can recurse into
+  // each other during their mirror pass.
+  poolWater.visible = !driving;
 }
 
 let audioContext;
@@ -1845,16 +1855,21 @@ function showDriveBriefing() {
 
 function startDrive() {
   ensureAudio();
-  driveMode.start();
-  driveSession.countdown = debugRaceQuery ? 0.08 : 3.25;
-  state.mode = 'drive-countdown';
+  const debugStartDistance = debugRaceQuery && Number.isFinite(requestedDriveDistance)
+    ? Math.max(0, requestedDriveDistance)
+    : 0;
+  driveMode.start(debugStartDistance);
+  driveSession.countdown = debugFreezeQuery ? 0 : (debugRaceQuery ? 0.08 : 3.25);
+  state.mode = debugFreezeQuery ? 'drive-active' : 'drive-countdown';
   state.started = true;
+  state.grounded = !driveMode.state.airborne;
   raceGroup.visible = false;
   driveMode.setVisible(true);
   ball.visible = false;
   motion.hideHud(raceHud, { immediate: true });
   motion.showHud(driveHud);
-  motion.showCountdown('3');
+  if (debugFreezeQuery) motion.hideCountdown();
+  else motion.showCountdown('3');
   motion.showTouchHint('‹  SWIPE TO CHANGE LANE  ›');
   applyModeLook('drive');
   setPanel(null);
@@ -1876,11 +1891,28 @@ function writeDriveRecords() {
   }
 }
 
-function handleDriveCollect() {
-  showToast('DATA SHARD +1', 0.8);
+function handleDriveCollect(kind = 'shard') {
+  const isOrb = kind === 'orb';
+  showToast(isOrb ? 'FLOATING ORB +1' : 'DATA SHARD +1', 0.8);
   motion.pulse(driveHudShards, { strength: 1.32, color: 'brightness(1.7) saturate(1.45)' });
-  playTone(680 + (driveMode.state.shards % 4) * 90, 0.08, 'triangle', 0.08);
+  playTone((isOrb ? 780 : 680) + (driveMode.state.shards % 4) * 90, 0.08, 'triangle', 0.08);
   haptic('collect');
+  updateDriveHud();
+}
+
+function handleDriveSectionChange(section) {
+  const feedback = {
+    'canal-ahead': { message: 'AQUA LINK AHEAD', tone: 260, haptic: 'warning' },
+    'entry-takeoff': { message: 'RAMP LOCK · TRANSFORM', tone: 360, haptic: 'jump' },
+    'boat-deployed': { message: 'SPEEDBOAT ONLINE', tone: 610, haptic: 'success' },
+    'exit-takeoff': { message: 'ROADLINK · TRANSFORM', tone: 430, haptic: 'jump' },
+    'car-restored': { message: 'COUPE ONLINE', tone: 520, haptic: 'impact' },
+  }[section.event];
+  if (!feedback) return;
+  showToast(feedback.message, section.event.includes('takeoff') ? 1.05 : 0.85);
+  playTone(feedback.tone, section.event.includes('takeoff') ? 0.2 : 0.12, 'sawtooth', 0.09);
+  haptic(feedback.haptic);
+  motion.pulse(driveHudSection, { strength: 1.18, color: 'brightness(1.55) saturate(1.4)' });
   updateDriveHud();
 }
 
@@ -1898,7 +1930,7 @@ function finishDrive() {
   refreshDriveRecordUI();
   driveFinishDistance.textContent = `${Math.floor(distance)} m`;
   driveFinishShards.textContent = String(shards);
-  driveFinishRecord.textContent = newDistanceRecord ? 'NEW DISTANCE RECORD' : (newShardRecord ? 'NEW SHARD RECORD' : 'RUN SAVED');
+  driveFinishRecord.textContent = newDistanceRecord ? 'NEW DISTANCE RECORD' : (newShardRecord ? 'NEW PICKUP RECORD' : 'RUN SAVED');
   motion.hideHud(driveHud);
   motion.hideCountdown();
   setPanel(driveFinishPanel);
@@ -2232,8 +2264,13 @@ function updateRaceHud() {
 }
 
 function updateDriveHud() {
+  const waterPhase = driveMode.state.phase === 'canal';
+  const amphibiousPhase = driveMode.state.phase.startsWith('canal');
   driveHudDistance.textContent = `${Math.floor(driveMode.state.distance)} m`;
-  driveHudShards.textContent = String(driveMode.state.shards);
+  driveHudProtocol.textContent = amphibiousPhase ? 'RUN · AMPHIBIOUS LINK' : 'DRIVE · NEON NIGHTSHIFT';
+  driveHudSection.textContent = driveMode.state.sectionLabel;
+  driveHudPickupLabel.textContent = waterPhase ? 'ORBS' : 'PICKUPS';
+  driveHudShards.textContent = String(waterPhase ? driveMode.state.orbs : driveMode.state.shards);
   driveHudLane.textContent = `${driveMode.state.targetLane + 1} / 3`;
   driveHudSpeed.textContent = `${Math.round(driveMode.state.speed * 4.2)} KM/H`;
   motion.setSpeed(driveSpeedFill, driveMode.state.speed / 62);
@@ -2370,8 +2407,8 @@ function fixedUpdate(dt) {
     state.grounded = raceMotor.grounded;
     state.coyoteTime = raceMotor.grounded ? 0.1 : 0;
   } else if (isDriveMode()) {
-    state.grounded = true;
-    state.coyoteTime = 0;
+    state.grounded = !driveMode.state.airborne;
+    state.coyoteTime = state.grounded ? 0.1 : 0;
   }
 
   if (state.mode === 'race-countdown') {
@@ -2498,6 +2535,9 @@ function updateVisuals(dt) {
   canvas.dataset.driveLane = String(driveMode.state.laneIndex);
   canvas.dataset.driveDistance = driveMode.state.distance.toFixed(2);
   canvas.dataset.driveShards = String(driveMode.state.shards);
+  canvas.dataset.driveOrbs = String(driveMode.state.orbs);
+  canvas.dataset.drivePhase = driveMode.state.phase;
+  canvas.dataset.driveVehicle = driveMode.state.vehicle;
   if (isRaceMode()) {
     const frame = getRaceFrame(raceMotor.distance);
     makeRaceBasis(frame, raceBallBasis);
@@ -2681,10 +2721,14 @@ function frame(_time, deltaTime) {
     fpsFrames = 0;
     fpsElapsed = 0;
   }
-  accumulator += delta;
-  while (accumulator >= 1 / 60) {
-    fixedUpdate(1 / 60);
-    accumulator -= 1 / 60;
+  if (debugFreezeQuery) {
+    accumulator = 0;
+  } else {
+    accumulator += delta;
+    while (accumulator >= 1 / 60) {
+      fixedUpdate(1 / 60);
+      accumulator -= 1 / 60;
+    }
   }
   motionClock += motionDelta;
   gsap.updateRoot(motionClock);
@@ -2708,7 +2752,7 @@ window.render_game_to_text = () => {
   });
   const currentSection = raceSectionAtDistance(raceMotor.distance);
   return JSON.stringify({
-    coordinateSystem: 'Free Mode uses world Y-up physics; Race Mode uses a track-local looping frame; Drive Mode uses straight three-lane logic with view-space shader curvature',
+    coordinateSystem: 'Free Mode uses world Y-up physics; Race Mode uses a track-local looping frame; Drive Mode uses straight three-lane road/canal logic with view-space shader curvature',
     mode: state.mode,
     lastKey: state.lastKey,
     player: {
@@ -2764,9 +2808,21 @@ window.render_game_to_text = () => {
       coinCrashes: race.coinCrashes,
     },
     drive: driveMode.snapshot(),
-    performance: { fps: state.fps, mobileMode: isMobileDevice, pixelRatio: qualityRatio, antialiasSamples: isMobileDevice ? 0 : 4, shadowMap: isMobileDevice ? 1024 : 2048, reflectionMap: isMobileDevice ? 384 : 768, postProcessing: !isMobileDevice && !isRunnerMode(), gtaoEnabled: gtao.enabled && !isRunnerMode(), gtaoSamples: gtao.enabled && !isRunnerMode() ? gtaoSamples : 0 },
+    performance: {
+      fps: state.fps,
+      mobileMode: isMobileDevice,
+      pixelRatio: qualityRatio,
+      antialiasSamples: isMobileDevice ? 0 : 4,
+      shadowMap: isMobileDevice ? 1024 : 2048,
+      reflectionMap: isDriveMode()
+        ? (driveMode.state.phase === 'city' ? 0 : (isMobileDevice ? 256 : 512))
+        : (isMobileDevice ? 384 : 768),
+      postProcessing: !isMobileDevice && !isRunnerMode(),
+      gtaoEnabled: gtao.enabled && !isRunnerMode(),
+      gtaoSamples: gtao.enabled && !isRunnerMode() ? gtaoSamples : 0,
+    },
     controls: isDriveMode()
-      ? 'automatic acceleration, three fixed lanes, A/D or Left/Right switch one lane, horizontal swipe switches one lane, R restart'
+      ? 'automatic car and speedboat acceleration, three fixed lanes, A/D or Left/Right switch one lane, horizontal swipe switches one lane, ramps and vehicle transformations are automatic, R restart'
       : (isRaceMode()
         ? 'automatic high-speed forward roll, drag horizontally to steer, tap or Space to jump including in air, fixed chase camera, R reset to last checkpoint'
         : (isMobileDevice ? 'automatic forward roll, one-finger horizontal slide steering, tap or upward swipe jump with repeatable air jumps, automatic camera, Reset button' : 'WASD/arrows roll, Space jump, drag look, R reset, F fullscreen')),
@@ -2779,12 +2835,20 @@ window.render_game_to_text = () => {
       return { name, species, x, z, blocks: count, currentBaseY: +baseBlock.body.translation().y.toFixed(2) };
     }),
     environment: isDriveMode()
-      ? { vehicle: 'procedural neon cyber coupe', road: 'clearcoated procedural wet asphalt with neon lane reflections', terrain: 'camera-centered ImprovedNoise FBM mesh', city: 'recycled procedural building pools', curvature: 'shared view-space parabolic vertex bend' }
+      ? {
+          vehicle: driveMode.state.vehicle,
+          surface: driveMode.state.surface,
+          road: 'clearcoated procedural wet asphalt with neon lane reflections',
+          canal: 'official Three.js Water planar reflections with procedural normals and pooled water gameplay',
+          terrain: 'camera-centered ImprovedNoise FBM mesh',
+          city: 'recycled cyber towers plus pooled Art Deco hotels, condos, nightclubs, billboards, palms, and bushes',
+          curvature: 'shared view-space parabolic vertex bend on road and canal scenery; mathematically flat reflective water plane',
+        }
       : (isRaceMode()
         ? { playerMaterial: 'rigid texture-free procedural PBR marble', sky: 'procedural stars and magenta nebula', terrain: 'ImprovedNoise track-following canyon', monuments: '7 colossal arches plus 14 concrete and glossy-metal walls', moon: 'synthetic cyan' }
         : { playerMaterial: 'rigid texture-free procedural PBR marble', sky: 'procedural Preetham', sunElevation: skySettings.elevation, water: 'planar reflective', waves: 'three small geometric wave bands, max amplitude 0.046' }),
     landmarks: isDriveMode()
-      ? ['three fixed neon lanes', 'striped synthetic sun', 'endless paired cyber towers', 'procedural mountain walls beyond the city']
+      ? ['three fixed neon road and canal lanes', 'striped synthetic sun', 'entry and exit transformation ramps', 'reflective turquoise tideway', 'endless cyber towers and Art Deco waterfront', 'leaning canal palms and neon billboards']
       : (isRaceMode()
         ? [`start elevation ${raceTrackSamples[0].center.y.toFixed(0)}`, `${RACE_CHECKPOINT_DISTANCES.length} checkpoints divide ${COURSE_SECTIONS.length} paced sections`, `finish elevation ${raceTrackSamples.at(-1).center.y.toFixed(0)}`, `6500-unit banked half-pipe with strong S-turns and ${TRACK_LOOPS.length} complete vertical loops`, 'procedural canyon and seven monumental arches']
         : ['gold arch at (0, -5)', 'rose/coral stairs near (-7, -5)', 'coral arch at (7, -12)']),

@@ -453,6 +453,21 @@ body.is-drive-mode #touch-hint {
     padding: 10px;
   }
   .hud-course { display: none; }
+  .drive-hud .hud-course {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    display: block;
+    min-width: 0;
+    padding: 6px 9px;
+    border: 1px solid rgba(255, 42, 158, .34);
+    border-radius: 999px;
+    background: rgba(4, 5, 20, .76);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 7px 24px rgba(255, 0, 124, .12);
+  }
+  .drive-hud .hud-course span { display: none; }
+  .drive-hud .hud-course strong { font: 600 8px/1 DM Mono, monospace; letter-spacing: .08em; }
   .race-hud:not(.drive-hud) .hud-shield {
     width: 27px;
     font-size: 0;

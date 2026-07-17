@@ -3,12 +3,73 @@ import { gsap } from 'gsap';
 import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { DriveVisualGains } from './DriveVisualGains.js';
+import { DriveCanalSection } from './DriveCanalSection.js';
 
 const DRIVE_ORIGIN_X = -1000;
 const ROAD_NEAR_Z = 18;
 const ROAD_FAR_Z = -300;
 const CAR_Z = 4;
 const LANE_X = [-3.25, 0, 3.25];
+const DRIVE_CYCLE_LENGTH = 1100;
+const CANAL_APPROACH_START = 250;
+const CANAL_ENTRY_START = 300;
+const CANAL_RUN_START = 345;
+const CANAL_EXIT_START = 820;
+const CANAL_RETURN_START = 865;
+
+function driveSectionAtDistance(distance) {
+  const cycleIndex = Math.max(0, Math.floor(distance / DRIVE_CYCLE_LENGTH));
+  const cycleDistance = ((distance % DRIVE_CYCLE_LENGTH) + DRIVE_CYCLE_LENGTH) % DRIVE_CYCLE_LENGTH;
+  let phase = 'city';
+  let label = 'ENDLESS CITY';
+  let start = 0;
+  let end = CANAL_APPROACH_START;
+  let vehicle = 'car';
+  let surface = 'road';
+
+  if (cycleDistance >= CANAL_APPROACH_START && cycleDistance < CANAL_ENTRY_START) {
+    phase = 'canal-approach';
+    label = 'AQUA LINK';
+    start = CANAL_APPROACH_START;
+    end = CANAL_ENTRY_START;
+  } else if (cycleDistance >= CANAL_ENTRY_START && cycleDistance < CANAL_RUN_START) {
+    phase = 'canal-entry';
+    label = 'AMPHIBIOUS TRANSFORM';
+    start = CANAL_ENTRY_START;
+    end = CANAL_RUN_START;
+    vehicle = 'transforming-to-boat';
+    surface = 'air';
+  } else if (cycleDistance >= CANAL_RUN_START && cycleDistance < CANAL_EXIT_START) {
+    phase = 'canal';
+    label = 'NEON TIDEWAY';
+    start = CANAL_RUN_START;
+    end = CANAL_EXIT_START;
+    vehicle = 'speedboat';
+    surface = 'water';
+  } else if (cycleDistance >= CANAL_EXIT_START && cycleDistance < CANAL_RETURN_START) {
+    phase = 'canal-exit';
+    label = 'ROADLINK TRANSFORM';
+    start = CANAL_EXIT_START;
+    end = CANAL_RETURN_START;
+    vehicle = 'transforming-to-car';
+    surface = 'air';
+  } else if (cycleDistance >= CANAL_RETURN_START) {
+    start = CANAL_RETURN_START;
+    end = DRIVE_CYCLE_LENGTH;
+  }
+
+  return {
+    phase,
+    label,
+    vehicle,
+    surface,
+    cycleIndex,
+    cycleDistance,
+    progress: THREE.MathUtils.clamp((cycleDistance - start) / Math.max(1, end - start), 0, 1),
+    start,
+    end,
+  };
+}
 
 function smoothDamp(current, target, rate, dt) {
   return THREE.MathUtils.lerp(current, target, 1 - Math.exp(-rate * dt));
@@ -19,6 +80,7 @@ export class DriveMode {
     isMobile = false,
     onCollect = () => {},
     onCrash = () => {},
+    onSectionChange = () => {},
     prefersReducedMotion = () => false,
   } = {}) {
     this.scene = scene;
@@ -26,6 +88,7 @@ export class DriveMode {
     this.viewportAspect = innerWidth / Math.max(1, innerHeight);
     this.onCollect = onCollect;
     this.onCrash = onCrash;
+    this.onSectionChange = onSectionChange;
     this.prefersReducedMotion = prefersReducedMotion;
     this.noise = new ImprovedNoise();
     this.randomState = 0x5f3759df;
@@ -40,10 +103,19 @@ export class DriveMode {
       distance: 0,
       speed: 0,
       shards: 0,
+      orbs: 0,
       score: 0,
       elapsed: 0,
       crashed: false,
       laneChanges: 0,
+      phase: 'city',
+      sectionLabel: 'ENDLESS CITY',
+      cycleIndex: 0,
+      cycleDistance: 0,
+      sectionProgress: 0,
+      vehicle: 'car',
+      surface: 'road',
+      airborne: false,
     };
     this.bendUniforms = {
       uDriveTime: { value: 0 },
@@ -74,6 +146,18 @@ export class DriveMode {
     this.createCity();
     this.createRunnerObjects();
     this.createCar();
+    this.canalSection = new DriveCanalSection(this.root, {
+      isMobile: this.isMobile,
+      patchMaterial: (material, key, style) => this.patchBend(material, key, style),
+      onCollect: (event) => this.handleCanalCollect(event),
+      onCrash: (event) => this.handleCanalCrash(event),
+      prefersReducedMotion: this.prefersReducedMotion,
+    });
+    this.boatRig = this.canalSection.boatRig;
+    this.carImpactRig.add(this.boatRig);
+    this.createMorphEffects();
+    this.createVehicleMorphTimelines();
+    this.createTransitionRamps();
     this.createLights();
     this.visualGains = new DriveVisualGains(this.root, this.car, {
       isMobile: this.isMobile,
@@ -250,6 +334,9 @@ export class DriveMode {
   }
 
   createRoad() {
+    this.roadEnvironment = new THREE.Group();
+    this.roadEnvironment.name = 'Drive road deck and neon edges';
+    this.root.add(this.roadEnvironment);
     const roadMaterial = this.patchBend(new THREE.MeshPhysicalMaterial({
       color: '#02040a', roughness: 0.26, metalness: 0.08,
       clearcoat: 1, clearcoatRoughness: 0.055, envMapIntensity: 0.58,
@@ -260,7 +347,7 @@ export class DriveMode {
     this.road.position.set(0, -0.16, -141);
     this.road.frustumCulled = false;
     this.road.receiveShadow = true;
-    this.root.add(this.road);
+    this.roadEnvironment.add(this.road);
 
     const curbMaterial = this.patchBend(new THREE.MeshStandardMaterial({
       color: '#030611', roughness: 0.72, metalness: 0.12, emissive: '#020713', emissiveIntensity: 0.18,
@@ -270,7 +357,7 @@ export class DriveMode {
       curb.position.set(side * 6.8, -0.04, -141);
       curb.frustumCulled = false;
       curb.receiveShadow = true;
-      this.root.add(curb);
+      this.roadEnvironment.add(curb);
 
       const railMaterial = this.patchBend(new THREE.MeshBasicMaterial({
         color: side < 0 ? '#14dcff' : '#ff1b8d', toneMapped: false,
@@ -278,7 +365,7 @@ export class DriveMode {
       const rail = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.08, 320, 1, 1, this.isMobile ? 64 : 128), railMaterial);
       rail.position.set(side * 6.03, 0.05, -141);
       rail.frustumCulled = false;
-      this.root.add(rail);
+      this.roadEnvironment.add(rail);
     }
   }
 
@@ -319,6 +406,9 @@ export class DriveMode {
   }
 
   createTerrain() {
+    this.terrainGroup = new THREE.Group();
+    this.terrainGroup.name = 'Drive procedural terrain';
+    this.root.add(this.terrainGroup);
     const terrainMaterial = this.patchBend(new THREE.MeshStandardMaterial({
       color: '#090919', roughness: 0.78, metalness: 0.2, emissive: '#100018', emissiveIntensity: 0.3,
       flatShading: true, side: THREE.DoubleSide,
@@ -335,7 +425,7 @@ export class DriveMode {
       surface.receiveShadow = true;
       wire.frustumCulled = false;
       wire.renderOrder = 1;
-      this.root.add(surface, wire);
+      this.terrainGroup.add(surface, wire);
       this.terrainMeshes.push({ geometry, surface, wire });
     }
     this.updateTerrain(true);
@@ -364,6 +454,9 @@ export class DriveMode {
   }
 
   createCity() {
+    this.cityGroup = new THREE.Group();
+    this.cityGroup.name = 'Drive recycled cyber city';
+    this.root.add(this.cityGroup);
     this.buildingMaterials = [
       this.patchBend(new THREE.MeshStandardMaterial({ color: '#080d1d', roughness: 0.7, metalness: 0.25, emissive: '#02040c', emissiveIntensity: 0.2 }), 'building-a', 'building'),
       this.patchBend(new THREE.MeshStandardMaterial({ color: '#111126', roughness: 0.62, metalness: 0.32, emissive: '#080314', emissiveIntensity: 0.25 }), 'building-b', 'building'),
@@ -385,7 +478,7 @@ export class DriveMode {
       body.frustumCulled = false;
       sign.frustumCulled = false;
       group.add(body, sign);
-      this.root.add(group);
+      this.cityGroup.add(group);
       const building = { group, body, sign, side: index % 2 ? 1 : -1, speedFactor: 1 };
       this.buildings.push(building);
       this.recycleBuilding(building, -18 - index * (this.isMobile ? 10 : 7.2));
@@ -406,6 +499,9 @@ export class DriveMode {
   }
 
   createRunnerObjects() {
+    this.runnerGroup = new THREE.Group();
+    this.runnerGroup.name = 'Drive road pickups and barriers';
+    this.root.add(this.runnerGroup);
     const barrierMaterial = this.patchBend(new THREE.MeshPhysicalMaterial({
       color: '#5b0a2d', emissive: '#ff056f', emissiveIntensity: 2.4,
       roughness: 0.18, metalness: 0.65, clearcoat: 1, clearcoatRoughness: 0.08,
@@ -425,7 +521,7 @@ export class DriveMode {
       shard.frustumCulled = false;
       barrier.castShadow = true;
       barrier.receiveShadow = true;
-      this.root.add(barrier, shard);
+      this.runnerGroup.add(barrier, shard);
       const object = { barrier, shard, kind: 'shard', lane: 1, z: -30, resolved: false };
       this.runnerObjects.push(object);
       this.recycleRunnerObject(object, -34 - index * 19);
@@ -451,12 +547,18 @@ export class DriveMode {
     this.car.position.set(0, 0.06, CAR_Z);
     this.root.add(this.car);
 
+    this.vehicleLiftRig = new THREE.Group();
+    this.vehicleLiftRig.name = 'GSAP amphibious jump presentation';
     this.carMotionRig = new THREE.Group();
     this.carMotionRig.name = 'GSAP lane and hover presentation';
     this.carImpactRig = new THREE.Group();
     this.carImpactRig.name = 'GSAP impact presentation';
-    this.car.add(this.carMotionRig);
+    this.carVisualRig = new THREE.Group();
+    this.carVisualRig.name = 'Cyber coupe visual';
+    this.car.add(this.vehicleLiftRig);
+    this.vehicleLiftRig.add(this.carMotionRig);
     this.carMotionRig.add(this.carImpactRig);
+    this.carImpactRig.add(this.carVisualRig);
 
     const paint = new THREE.MeshPhysicalMaterial({
       color: '#09071d', metalness: 0.46, roughness: 0.24,
@@ -479,38 +581,38 @@ export class DriveMode {
     const cabin = new THREE.Mesh(new RoundedBoxGeometry(2.62, 0.84, 2.15, 5, 0.2), glass);
     cabin.position.set(0, 1.23, 0.2);
     cabin.scale.set(0.92, 1, 0.95);
-    this.carImpactRig.add(lower, hood, cabin);
+    this.carVisualRig.add(lower, hood, cabin);
 
     for (const side of [-1, 1]) {
       for (const z of [-1.45, 1.45]) {
         const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.48, 0.48, 0.34, 18), tire);
         wheel.rotation.z = Math.PI / 2;
         wheel.position.set(side * 1.72, 0.38, z);
-        this.carImpactRig.add(wheel);
+        this.carVisualRig.add(wheel);
       }
       const tail = new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.22, 0.08), red);
       tail.position.set(side * 0.95, 0.72, 2.57);
-      this.carImpactRig.add(tail);
+      this.carVisualRig.add(tail);
       const sideStrip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 3.9), side < 0 ? cyan : magenta);
       sideStrip.position.set(side * 1.72, 0.55, 0.1);
-      this.carImpactRig.add(sideStrip);
+      this.carVisualRig.add(sideStrip);
     }
     const rearStrip = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.07, 0.08), magenta);
     rearStrip.position.set(0, 0.92, 2.59);
-    this.carImpactRig.add(rearStrip);
+    this.carVisualRig.add(rearStrip);
     const underglow = new THREE.Mesh(new THREE.PlaneGeometry(3.1, 4.5), new THREE.MeshBasicMaterial({
       color: '#ff0e8d', transparent: true, opacity: 0.26, blending: THREE.AdditiveBlending,
       depthWrite: false, toneMapped: false,
     }));
     underglow.rotation.x = -Math.PI / 2;
     underglow.position.y = 0.01;
-    this.carImpactRig.add(underglow);
+    this.carVisualRig.add(underglow);
     this.underglow = underglow;
     const spoiler = new THREE.Mesh(new THREE.BoxGeometry(3.1, 0.12, 0.36), paint);
     spoiler.position.set(0, 1.25, 2.15);
-    this.carImpactRig.add(spoiler);
+    this.carVisualRig.add(spoiler);
 
-    this.carImpactRig.traverse((child) => {
+    this.carVisualRig.traverse((child) => {
       if (!child.isMesh || child.material?.transparent) return;
       child.castShadow = true;
       child.receiveShadow = true;
@@ -529,6 +631,244 @@ export class DriveMode {
     }, 0);
   }
 
+  createTransitionRamps() {
+    this.transitionGroup = new THREE.Group();
+    this.transitionGroup.name = 'Amphibious transition ramps';
+    this.root.add(this.transitionGroup);
+
+    const deckMaterial = this.patchBend(new THREE.MeshPhysicalMaterial({
+      color: '#080918',
+      emissive: '#07132a',
+      emissiveIntensity: 0.75,
+      roughness: 0.2,
+      metalness: 0.58,
+      clearcoat: 1,
+      clearcoatRoughness: 0.08,
+    }), 'amphibious-ramp-deck');
+    const cyan = this.patchBend(new THREE.MeshBasicMaterial({
+      color: '#28f6ff', toneMapped: false,
+    }), 'amphibious-ramp-cyan');
+    const magenta = this.patchBend(new THREE.MeshBasicMaterial({
+      color: '#ff1c93', toneMapped: false,
+    }), 'amphibious-ramp-magenta');
+
+    const makeRamp = (name, accentMaterial) => {
+      const group = new THREE.Group();
+      group.name = name;
+      const deck = new THREE.Mesh(
+        new THREE.BoxGeometry(11.8, 0.5, 15, 1, 1, this.isMobile ? 12 : 24),
+        deckMaterial,
+      );
+      deck.position.y = 0.72;
+      deck.rotation.x = -0.135;
+      deck.castShadow = true;
+      deck.receiveShadow = true;
+      group.add(deck);
+
+      for (const side of [-1, 1]) {
+        const rail = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.18, 15), side < 0 ? cyan : magenta);
+        rail.position.set(side * 5.78, 1.02, 0);
+        rail.rotation.x = -0.135;
+        group.add(rail);
+      }
+      for (let index = 0; index < 5; index++) {
+        const chevron = new THREE.Mesh(new THREE.BoxGeometry(1.35, 0.045, 0.18), accentMaterial);
+        chevron.position.set(0, 1.08 + index * 0.08, 4.7 - index * 2.35);
+        chevron.rotation.x = -0.135;
+        group.add(chevron);
+      }
+      const portal = new THREE.Group();
+      const portalPostGeometry = new THREE.BoxGeometry(0.22, 5.8, 0.24);
+      for (const side of [-1, 1]) {
+        const post = new THREE.Mesh(portalPostGeometry, side < 0 ? cyan : magenta);
+        post.position.set(side * 6.05, 3.0, -5.4);
+        portal.add(post);
+      }
+      const header = new THREE.Mesh(new THREE.BoxGeometry(12.3, 0.24, 0.24), accentMaterial);
+      header.position.set(0, 5.86, -5.4);
+      portal.add(header);
+      group.add(portal);
+      this.transitionGroup.add(group);
+      return group;
+    };
+
+    this.entryRamp = makeRamp('Road to canal launch ramp', cyan);
+    this.exitRamp = makeRamp('Canal to road launch ramp', magenta);
+  }
+
+  createMorphEffects() {
+    this.morphFxGroup = new THREE.Group();
+    this.morphFxGroup.name = 'GSAP amphibious transformation energy';
+    this.morphFxGroup.position.y = 0.85;
+    this.morphFxGroup.visible = false;
+    this.carImpactRig.add(this.morphFxGroup);
+
+    this.morphCoreMaterial = new THREE.MeshBasicMaterial({
+      color: '#f3ffff',
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+      side: THREE.DoubleSide,
+    });
+    const core = new THREE.Mesh(new THREE.SphereGeometry(1.72, 18, 12), this.morphCoreMaterial);
+    core.scale.set(1.1, 0.62, 1.45);
+    this.morphFxGroup.add(core);
+
+    this.morphRingMaterials = ['#25efff', '#ff2d9b'].map((color) => new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+      side: THREE.DoubleSide,
+    }));
+    this.morphRingMaterials.forEach((material, index) => {
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(2.05 + index * 0.32, 0.045, 8, 42), material);
+      ring.rotation.set(index ? 0.45 : -0.32, index ? 0.25 : -0.22, index * Math.PI / 2);
+      this.morphFxGroup.add(ring);
+    });
+  }
+
+  createVehicleMorphTimelines() {
+    this.vehiclePose = {
+      lift: 0,
+      pitch: 0,
+      roll: 0,
+      carScale: 1,
+      carSpin: 0,
+      boatScale: 0.001,
+      boatSpin: -Math.PI,
+      morphEnergy: 0,
+    };
+    this.entryMorphTimeline = gsap.timeline({ paused: true });
+    this.entryMorphTimeline
+      .fromTo(this.vehiclePose, {
+        lift: 0, pitch: 0, roll: 0,
+        carScale: 1, carSpin: 0,
+        boatScale: 0.001, boatSpin: -0.9,
+        morphEnergy: 0,
+      }, {
+        lift: this.prefersReducedMotion() ? 1.4 : 3.4,
+        pitch: this.prefersReducedMotion() ? -0.09 : -0.28,
+        roll: this.prefersReducedMotion() ? 0 : 0.08,
+        carScale: 0.24,
+        carSpin: this.prefersReducedMotion() ? 0.12 : 0.58,
+        boatScale: 0.58,
+        boatSpin: this.prefersReducedMotion() ? -0.12 : -0.72,
+        morphEnergy: 1,
+        duration: 0.48,
+        ease: 'power2.out',
+        immediateRender: false,
+      })
+      .to(this.vehiclePose, {
+        lift: 0.12,
+        pitch: 0,
+        roll: 0,
+        carScale: 0.001,
+        carSpin: 0.9,
+        boatScale: 1,
+        boatSpin: 0,
+        morphEnergy: 0,
+        duration: 0.52,
+        ease: 'power2.in',
+      });
+
+    this.exitMorphTimeline = gsap.timeline({ paused: true });
+    this.exitMorphTimeline
+      .fromTo(this.vehiclePose, {
+        lift: 0.12, pitch: 0, roll: 0,
+        carScale: 0.001, carSpin: 0.9,
+        boatScale: 1, boatSpin: 0,
+        morphEnergy: 0,
+      }, {
+        lift: this.prefersReducedMotion() ? 1.4 : 3.25,
+        pitch: this.prefersReducedMotion() ? -0.08 : -0.25,
+        roll: this.prefersReducedMotion() ? 0 : -0.08,
+        carScale: 0.58,
+        carSpin: this.prefersReducedMotion() ? 0.12 : -0.7,
+        boatScale: 0.24,
+        boatSpin: this.prefersReducedMotion() ? 0.12 : 0.62,
+        morphEnergy: 1,
+        duration: 0.48,
+        ease: 'power2.out',
+        immediateRender: false,
+      })
+      .to(this.vehiclePose, {
+        lift: 0,
+        pitch: 0,
+        roll: 0,
+        carScale: 1,
+        carSpin: 0,
+        boatScale: 0.001,
+        boatSpin: 0.9,
+        morphEnergy: 0,
+        duration: 0.52,
+        ease: 'power2.in',
+      });
+    this.syncVehiclePose(driveSectionAtDistance(0));
+  }
+
+  applyVehiclePose(section) {
+    const pose = this.vehiclePose;
+    this.vehicleLiftRig.position.y = pose.lift;
+    this.vehicleLiftRig.rotation.set(pose.pitch, 0, pose.roll);
+    this.carVisualRig.scale.setScalar(Math.max(0.001, pose.carScale));
+    this.carVisualRig.rotation.y = pose.carSpin;
+    if (this.boatRig) {
+      this.boatRig.scale.setScalar(Math.max(0.001, pose.boatScale));
+      this.boatRig.rotation.y = pose.boatSpin;
+      this.boatRig.visible = section.phase === 'canal'
+        || section.phase === 'canal-entry'
+        || section.phase === 'canal-exit';
+    }
+    this.carVisualRig.visible = section.phase !== 'canal';
+    if (this.morphFxGroup) {
+      const energy = THREE.MathUtils.clamp(pose.morphEnergy, 0, 1);
+      this.morphFxGroup.visible = energy > 0.01;
+      this.morphFxGroup.scale.setScalar(0.62 + energy * 0.5);
+      this.morphFxGroup.rotation.z = energy * 0.72;
+      this.morphCoreMaterial.opacity = energy * (this.prefersReducedMotion() ? 0.12 : 0.23);
+      this.morphRingMaterials[0].opacity = energy * 0.74;
+      this.morphRingMaterials[1].opacity = energy * 0.5;
+    }
+  }
+
+  syncVehiclePose(section) {
+    if (!this.vehiclePose) return;
+    if (section.phase === 'canal-entry') {
+      this.entryMorphTimeline.progress(section.progress, true);
+    } else if (section.phase === 'canal') {
+      Object.assign(this.vehiclePose, {
+        lift: 0.12, pitch: 0, roll: 0,
+        carScale: 0.001, carSpin: Math.PI,
+        boatScale: 1, boatSpin: 0, morphEnergy: 0,
+      });
+    } else if (section.phase === 'canal-exit') {
+      this.exitMorphTimeline.progress(section.progress, true);
+    } else {
+      Object.assign(this.vehiclePose, {
+        lift: 0, pitch: 0, roll: 0,
+        carScale: 1, carSpin: 0,
+        boatScale: 0.001, boatSpin: -0.9, morphEnergy: 0,
+      });
+    }
+    this.applyVehiclePose(section);
+  }
+
+  updateTransitionRamps(section) {
+    const localDistance = section.cycleDistance;
+    const entryDelta = CANAL_ENTRY_START - localDistance;
+    const exitDelta = CANAL_EXIT_START - localDistance;
+    this.entryRamp.position.z = CAR_Z - entryDelta;
+    this.exitRamp.position.z = CAR_Z - exitDelta;
+    this.entryRamp.visible = localDistance > CANAL_APPROACH_START - 110 && localDistance < CANAL_RUN_START + 28;
+    this.exitRamp.visible = localDistance > CANAL_EXIT_START - 145 && localDistance < CANAL_RETURN_START + 32;
+    this.transitionGroup.visible = this.entryRamp.visible || this.exitRamp.visible;
+  }
+
   createLights() {
     this.root.add(new THREE.HemisphereLight('#242c62', '#07020d', 0.72));
     const cyanLight = new THREE.PointLight('#19dfff', 18, 22, 2);
@@ -538,11 +878,75 @@ export class DriveMode {
     this.root.add(cyanLight, magentaLight);
   }
 
-  reset() {
-    this.randomState = 0x5f3759df;
+  applySectionState(section, { emit = false } = {}) {
+    const previousPhase = this.state.phase;
     Object.assign(this.state, {
-      laneIndex: 1, targetLane: 1, lateralX: 0, distance: 0, speed: 0,
-      shards: 0, score: 0, elapsed: 0, crashed: false, laneChanges: 0,
+      phase: section.phase,
+      sectionLabel: section.label,
+      cycleIndex: section.cycleIndex,
+      cycleDistance: section.cycleDistance,
+      sectionProgress: section.progress,
+      vehicle: section.vehicle,
+      surface: section.surface,
+      airborne: section.surface === 'air',
+    });
+
+    const exitRoadVisible = section.phase === 'canal-exit' && section.progress >= 0.44;
+    const roadVisible = section.phase === 'city'
+      || section.phase === 'canal-approach'
+      || exitRoadVisible;
+    if (previousPhase === 'city' && section.phase === 'canal-approach') {
+      this.canalSection.reset();
+    }
+    if (previousPhase === 'canal-exit' && section.phase === 'city') {
+      // The hidden city pool keeps recycling during the canal. Re-seed its
+      // collision lane well ahead of the car so the restored road always
+      // gives the player a readable reaction window.
+      this.runnerObjects.forEach((object, index) => {
+        this.recycleRunnerObject(object, -42 - index * 19);
+      });
+    }
+    this.roadEnvironment.visible = roadVisible;
+    this.terrainGroup.visible = roadVisible;
+    this.cityGroup.visible = roadVisible;
+    this.runnerGroup.visible = section.phase === 'city';
+    this.canalSection.setActive(section.phase !== 'city');
+    this.updateTransitionRamps(section);
+    this.syncVehiclePose(section);
+    this.visualGains?.setSurface?.(section.surface);
+
+    if (emit && previousPhase !== section.phase) {
+      const eventByPhase = {
+        'canal-approach': 'canal-ahead',
+        'canal-entry': 'entry-takeoff',
+        canal: 'boat-deployed',
+        'canal-exit': 'exit-takeoff',
+        city: previousPhase === 'canal-exit' ? 'car-restored' : 'city-loop',
+      };
+      this.onSectionChange({
+        event: eventByPhase[section.phase],
+        previousPhase,
+        ...section,
+      });
+    }
+  }
+
+  reset(startDistance = 0) {
+    this.randomState = 0x5f3759df;
+    const safeStartDistance = Math.max(0, Number.isFinite(startDistance) ? startDistance : 0);
+    const startSection = driveSectionAtDistance(safeStartDistance);
+    Object.assign(this.state, {
+      laneIndex: 1, targetLane: 1, lateralX: 0, distance: safeStartDistance, speed: 0,
+      shards: 0, orbs: 0, score: Math.floor(safeStartDistance * 2),
+      elapsed: 0, crashed: false, laneChanges: 0,
+      phase: startSection.phase,
+      sectionLabel: startSection.label,
+      cycleIndex: startSection.cycleIndex,
+      cycleDistance: startSection.cycleDistance,
+      sectionProgress: startSection.progress,
+      vehicle: startSection.vehicle,
+      surface: startSection.surface,
+      airborne: startSection.surface === 'air',
     });
     this.car.position.set(0, 0.06, CAR_Z);
     this.car.rotation.set(0, 0, 0);
@@ -551,29 +955,36 @@ export class DriveMode {
     this.carIdleTimeline.pause(0);
     gsap.killTweensOf([
       this.carMotionRig.rotation,
+      this.vehicleLiftRig.position,
+      this.vehicleLiftRig.rotation,
       this.carImpactRig.position,
       this.carImpactRig.rotation,
       this.carImpactRig.scale,
     ]);
     this.carMotionRig.position.set(0, 0, 0);
     this.carMotionRig.rotation.set(0, 0, 0);
+    this.vehicleLiftRig.position.set(0, 0, 0);
+    this.vehicleLiftRig.rotation.set(0, 0, 0);
     this.carImpactRig.position.set(0, 0, 0);
     this.carImpactRig.rotation.set(0, 0, 0);
     this.carImpactRig.scale.setScalar(1);
     this.underglow.material.opacity = 0.26;
     this.visualGains?.reset();
+    this.canalSection.reset();
     this.carIdleTimeline.restart();
     this.carIdleTimeline.paused(!this.root.visible);
     this.buildings.forEach((building, index) => this.recycleBuilding(building, -18 - index * (this.isMobile ? 10 : 7.2)));
     this.runnerObjects.forEach((object, index) => this.recycleRunnerObject(object, -34 - index * 19));
-    this.bendUniforms.uDriveTravel.value = 0;
+    this.bendUniforms.uDriveTravel.value = safeStartDistance;
     this.bendUniforms.uBendX.value = 0.00018;
     this.updateTerrain(true);
+    this.applySectionState(startSection);
   }
 
   setVisible(visible) {
     this.root.visible = visible;
     this.carIdleTimeline?.paused(!visible);
+    this.canalSection?.setActive(Boolean(visible && this.state.phase !== 'city'));
   }
 
   shiftLane(direction) {
@@ -628,6 +1039,26 @@ export class DriveMode {
       });
   }
 
+  handleCanalCollect(event) {
+    if (this.state.crashed || this.state.phase !== 'canal') return;
+    this.state.orbs += 1;
+    // Keep the legacy pickup total and record key compatible while exposing
+    // water orbs independently in semantic state and the adaptive HUD.
+    this.state.shards += 1;
+    this.state.score = Math.floor(this.state.distance * 2 + this.state.shards * 125);
+    const origin = new THREE.Vector3(LANE_X[event.lane], 0.65, event.z);
+    this.visualGains?.collect(origin);
+    this.onCollect(this.state, 'orb');
+  }
+
+  handleCanalCrash(event) {
+    if (this.state.crashed || this.state.phase !== 'canal') return;
+    this.state.crashed = true;
+    this.state.speed = 0;
+    this.animateCrash();
+    this.onCrash(this.state, event.kind);
+  }
+
   animateCrash() {
     this.laneTimeline?.kill();
     this.impactTimeline?.kill();
@@ -645,8 +1076,8 @@ export class DriveMode {
       .to(this.carImpactRig.scale, { x: 1, y: 1, z: 1, duration: 0.34, ease: 'elastic.out(1, 0.42)' }, '<');
   }
 
-  start() {
-    this.reset();
+  start(startDistance = 0) {
+    this.reset(startDistance);
     this.state.speed = 34;
   }
 
@@ -654,6 +1085,7 @@ export class DriveMode {
     this.bendUniforms.uDriveTime.value += dt;
     this.terrainAccumulator += dt;
     if (!active || this.state.crashed) {
+      this.canalSection.update(dt, { active: false });
       this.visualGains?.update(this.state, false);
       return;
     }
@@ -662,7 +1094,10 @@ export class DriveMode {
     this.state.speed = Math.min(62, this.state.speed + dt * 0.72);
     const advance = this.state.speed * dt;
     this.state.distance += advance;
-    this.state.score = Math.floor(this.state.distance * 2 + this.state.shards * 125);
+    const section = driveSectionAtDistance(this.state.distance);
+    this.applySectionState(section, { emit: true });
+    const roadGameplayActive = section.phase === 'city';
+    const canalGameplayActive = section.phase === 'canal';
     const targetX = LANE_X[this.state.targetLane];
     this.state.lateralX = smoothDamp(this.state.lateralX, targetX, 11.5, dt);
     this.car.position.x = this.state.lateralX;
@@ -694,14 +1129,14 @@ export class DriveMode {
         object.shard.rotation.x = phase * 0.37;
         object.shard.position.y = 1.05 + Math.sin(phase * 1.3) * (this.prefersReducedMotion() ? 0 : 0.12);
       }
-      if (!object.resolved) {
+      if (!object.resolved && roadGameplayActive) {
         const longitudinalDistance = Math.abs(object.z - CAR_Z);
         const lateralDistance = Math.abs(this.state.lateralX - LANE_X[object.lane]);
         if (object.kind === 'shard' && longitudinalDistance < 1.8 && lateralDistance < 1.85) {
           object.resolved = true;
           this.state.shards += 1;
           this.animateShardCollect(object);
-          this.onCollect(this.state);
+          this.onCollect(this.state, 'shard');
         } else if (object.kind === 'barrier' && longitudinalDistance < 2.9 && lateralDistance < 2.66) {
           object.resolved = true;
           this.state.crashed = true;
@@ -718,7 +1153,15 @@ export class DriveMode {
       }
     }
 
-    this.updateTerrain();
+    this.canalSection.update(dt, {
+      advance,
+      lateralX: this.state.lateralX,
+      speed: this.state.speed,
+      active: section.phase !== 'city',
+      collisionsEnabled: canalGameplayActive,
+    });
+    this.state.score = Math.floor(this.state.distance * 2 + this.state.shards * 125);
+    if (this.terrainGroup.visible) this.updateTerrain();
     this.visualGains?.update(this.state, !this.state.crashed);
   }
 
@@ -736,15 +1179,28 @@ export class DriveMode {
   }
 
   getCarWorldPosition(target = this.worldCarPosition) {
-    return target.set(DRIVE_ORIGIN_X + this.state.lateralX, this.car.position.y, CAR_Z);
+    return target.set(
+      DRIVE_ORIGIN_X + this.state.lateralX,
+      this.car.position.y + this.vehicleLiftRig.position.y,
+      CAR_Z,
+    );
   }
 
   nearbyObjects() {
+    if (this.state.phase === 'canal') {
+      return this.canalSection.nearbyObjects().map((object) => ({ ...object, surface: 'water' }));
+    }
     return this.runnerObjects
       .filter((object) => object.z > -70 && object.z < 16)
       .sort((a, b) => b.z - a.z)
       .slice(0, 6)
-      .map((object) => ({ kind: object.kind, lane: object.lane, z: +object.z.toFixed(1), resolved: object.resolved }));
+      .map((object) => ({
+        kind: object.kind,
+        lane: object.lane,
+        z: +object.z.toFixed(1),
+        resolved: object.resolved,
+        surface: 'road',
+      }));
   }
 
   snapshot() {
@@ -757,12 +1213,31 @@ export class DriveMode {
       distance: +this.state.distance.toFixed(1),
       score: this.state.score,
       shards: this.state.shards,
+      orbs: this.state.orbs,
+      pickups: this.state.shards,
       crashed: this.state.crashed,
       laneChanges: this.state.laneChanges,
+      phase: this.state.phase,
+      sectionLabel: this.state.sectionLabel,
+      sectionProgress: +this.state.sectionProgress.toFixed(3),
+      cycleIndex: this.state.cycleIndex,
+      cycleDistance: +this.state.cycleDistance.toFixed(1),
+      cycleLength: DRIVE_CYCLE_LENGTH,
+      vehicle: this.state.vehicle,
+      surface: this.state.surface,
+      airborne: this.state.airborne,
+      transitionMarkers: {
+        canalApproach: CANAL_APPROACH_START,
+        entryRamp: CANAL_ENTRY_START,
+        canalRun: CANAL_RUN_START,
+        exitRamp: CANAL_EXIT_START,
+        roadReturn: CANAL_RETURN_START,
+      },
       bendX: +this.bendUniforms.uBendX.value.toFixed(6),
       bendY: +this.bendUniforms.uBendY.value.toFixed(6),
       terrain: 'camera-centered ImprovedNoise FBM mesh resampled during travel',
       visualGains: this.visualGains?.snapshot(),
+      canal: this.canalSection.snapshot(),
       nearbyObjects: this.nearbyObjects(),
     };
   }
