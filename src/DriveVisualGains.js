@@ -9,6 +9,35 @@ function hashUnit(value) {
   return Math.abs(Math.sin(value * 91.345 + 17.17) * 43758.5453) % 1;
 }
 
+function smootherStep01(value) {
+  const t = THREE.MathUtils.clamp(value, 0, 1);
+  return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+function bridgeElevationAt(progress, variant) {
+  if (progress <= 0 || progress >= 1) return 0;
+  const rise = smootherStep01(progress / 0.235);
+  const descent = smootherStep01((1 - progress) / 0.235);
+  const highSpan = Math.min(rise, descent);
+  const crown = Math.pow(Math.sin(progress * Math.PI), 2);
+  const baseHeight = variant === 'desert' ? 12.2 : 13.8;
+  return highSpan * (baseHeight + crown * 1.65);
+}
+
+function bridgeElevationAndGradeAtZ(state, z) {
+  if (state.biome !== 'bridge') {
+    return { elevation: state.roadElevation || 0, grade: 0 };
+  }
+  const profileProgress = (state.bridgeProgress || 0) + (CAR_Z - z) / 300;
+  const epsilon = 0.0015;
+  const elevation = bridgeElevationAt(profileProgress, state.bridgeVariant);
+  const slope = (
+    bridgeElevationAt(profileProgress + epsilon, state.bridgeVariant)
+    - bridgeElevationAt(profileProgress - epsilon, state.bridgeVariant)
+  ) / (epsilon * 300 * 2);
+  return { elevation, grade: Math.atan(slope) };
+}
+
 function makeTrailMaterial(color) {
   return new THREE.ShaderMaterial({
     transparent: true,
@@ -402,8 +431,9 @@ export class DriveVisualGains {
       const seed = this.streakSeeds[index];
       const z = 14 - ((travel + seed.offset) % span);
       const length = (2.2 + speedAmount * 8.6 + this.boost.value * 5.2) * seed.length;
-      this.dummy.position.set(seed.x, -0.015, z);
-      this.dummy.rotation.set(0, 0, 0);
+      const roadSample = bridgeElevationAndGradeAtZ(state, z);
+      this.dummy.position.set(seed.x, roadSample.elevation - 0.015, z);
+      this.dummy.rotation.set(roadSample.grade, 0, 0);
       this.dummy.scale.set(seed.width, 0.012, length);
       this.dummy.updateMatrix();
       this.streakMesh.setMatrixAt(index, this.dummy.matrix);

@@ -12,6 +12,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { DriveMode } from './DriveMode.js';
 import { MotionDirector } from './MotionDirector.js';
@@ -190,7 +191,8 @@ sun.shadow.normalBias = 0.035;
 Object.assign(sun.shadow.camera, { left: -18, right: 18, top: 18, bottom: -18, near: 1, far: 42 });
 scene.add(sun);
 scene.add(sun.target);
-scene.add(new THREE.HemisphereLight('#b9e3ef', '#d89770', 0.24));
+const worldHemi = new THREE.HemisphereLight('#b9e3ef', '#d89770', 0.24);
+scene.add(worldHemi);
 
 const world = new RAPIER.World({ x: 0, y: -34, z: 0 });
 world.timestep = 1 / 60;
@@ -1562,13 +1564,14 @@ function applyModeLook(profile = 'free') {
   document.body.classList.toggle('is-drive-mode', driving);
   document.body.classList.toggle('is-runner-mode', racing || driving);
   const look = {
-    exposure: driving ? 0.66 : (racing ? 0.54 : 0.72),
-    environment: driving ? 0.38 : (racing ? 0.22 : 0.58),
-    fog: new THREE.Color(driving ? '#070817' : (racing ? '#091027' : '#9fc4ca')),
-    fogNear: driving ? 58 : (racing ? 105 : 70),
-    fogFar: driving ? 255 : (racing ? 330 : 190),
+    exposure: driving ? 0.68 : (racing ? 0.54 : 0.72),
+    environment: driving ? 0.2 : (racing ? 0.22 : 0.58),
+    fog: new THREE.Color(driving ? '#21082f' : (racing ? '#091027' : '#9fc4ca')),
+    fogNear: driving ? 38 : (racing ? 105 : 70),
+    fogFar: driving ? 210 : (racing ? 330 : 190),
     sun: new THREE.Color(driving ? '#a17cff' : (racing ? '#8adfff' : '#ffd2a0')),
-    sunIntensity: driving ? 0.38 : (racing ? 0.62 : 3.8),
+    sunIntensity: driving ? 0.24 : (racing ? 0.62 : 3.8),
+    hemiIntensity: driving ? 0.07 : (racing ? 0.12 : 0.24),
   };
   const duration = motion.time(0.58);
   gsap.to(renderer, { toneMappingExposure: look.exposure, duration, ease: 'power2.inOut', overwrite: 'auto' });
@@ -1577,6 +1580,7 @@ function applyModeLook(profile = 'free') {
   gsap.to(scene.fog.color, { r: look.fog.r, g: look.fog.g, b: look.fog.b, duration, ease: 'power2.inOut', overwrite: 'auto' });
   gsap.to(sun, { intensity: look.sunIntensity, duration, ease: 'power2.inOut', overwrite: 'auto' });
   gsap.to(sun.color, { r: look.sun.r, g: look.sun.g, b: look.sun.b, duration, ease: 'power2.inOut', overwrite: 'auto' });
+  gsap.to(worldHemi, { intensity: look.hemiIntensity, duration, ease: 'power2.inOut', overwrite: 'auto' });
   raceSkyDome.visible = racing;
   raceMoon.visible = racing;
   sky.visible = !racing && !driving;
@@ -1907,6 +1911,13 @@ function handleDriveSectionChange(section) {
     'boat-deployed': { message: 'SPEEDBOAT ONLINE', tone: 610, haptic: 'success' },
     'exit-takeoff': { message: 'ROADLINK · TRANSFORM', tone: 430, haptic: 'jump' },
     'car-restored': { message: 'COUPE ONLINE', tone: 520, haptic: 'impact' },
+    'desert-ahead': { message: 'BADLANDS LINK AHEAD', tone: 290, haptic: 'warning' },
+    'desert-entered': { message: 'MAGENTA BADLANDS', tone: 470, haptic: 'success' },
+    'bridge-climb': { message: 'SKYBRIDGE ASCENT', tone: 340, haptic: 'jump' },
+    'bridge-span': { message: 'HIGH SPAN LOCKED', tone: 620, haptic: 'success' },
+    'bridge-descent': { message: 'DESCENT VECTOR', tone: 390, haptic: 'impact' },
+    'desert-returned': { message: 'DESERT ROADLINK', tone: 510, haptic: 'impact' },
+    'city-returned': { message: 'NEON CITY ONLINE', tone: 560, haptic: 'success' },
   }[section.event];
   if (!feedback) return;
   showToast(feedback.message, section.event.includes('takeoff') ? 1.05 : 0.85);
@@ -2265,9 +2276,14 @@ function updateRaceHud() {
 
 function updateDriveHud() {
   const waterPhase = driveMode.state.phase === 'canal';
-  const amphibiousPhase = driveMode.state.phase.startsWith('canal');
+  const protocolByBiome = {
+    canal: 'RUN · AMPHIBIOUS LINK',
+    desert: 'RUN · NEON BADLANDS',
+    bridge: 'RUN · SKYBRIDGE',
+    city: 'DRIVE · NEON NIGHTSHIFT',
+  };
   driveHudDistance.textContent = `${Math.floor(driveMode.state.distance)} m`;
-  driveHudProtocol.textContent = amphibiousPhase ? 'RUN · AMPHIBIOUS LINK' : 'DRIVE · NEON NIGHTSHIFT';
+  driveHudProtocol.textContent = protocolByBiome[driveMode.state.biome] || protocolByBiome.city;
   driveHudSection.textContent = driveMode.state.sectionLabel;
   driveHudPickupLabel.textContent = waterPhase ? 'ORBS' : 'PICKUPS';
   driveHudShards.textContent = String(waterPhase ? driveMode.state.orbs : driveMode.state.shards);
@@ -2538,6 +2554,9 @@ function updateVisuals(dt) {
   canvas.dataset.driveOrbs = String(driveMode.state.orbs);
   canvas.dataset.drivePhase = driveMode.state.phase;
   canvas.dataset.driveVehicle = driveMode.state.vehicle;
+  canvas.dataset.driveBiome = driveMode.state.biome;
+  canvas.dataset.driveElevation = driveMode.state.roadElevation.toFixed(2);
+  canvas.dataset.driveBridgeVariant = driveMode.state.bridgeVariant;
   if (isRaceMode()) {
     const frame = getRaceFrame(raceMotor.distance);
     makeRaceBasis(frame, raceBallBasis);
@@ -2688,6 +2707,14 @@ gtao.blendIntensity = isMobileDevice ? 0.38 : 0.48;
 gtao.updateGtaoMaterial({ radius: 0.22, distanceExponent: 1.8, thickness: 1.0, scale: 0.85, samples: gtaoSamples });
 gtao.updatePdMaterial({ radius: isMobileDevice ? 2 : 3, rings: isMobileDevice ? 1 : 2, samples: gtaoSamples, lumaPhi: 10, depthPhi: 2, normalPhi: 3 });
 composer.addPass(gtao);
+const driveBloom = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight),
+  0.64,
+  0.44,
+  0.8,
+);
+driveBloom.enabled = false;
+composer.addPass(driveBloom);
 const gradePass = new ShaderPass(gradeShader);
 composer.addPass(gradePass);
 composer.addPass(new OutputPass());
@@ -2696,10 +2723,14 @@ function render(dt = 1 / 60) {
   updateVisuals(dt);
   poolWater.material.uniforms.time.value += dt * 0.42;
   gradePass.uniforms.time.value = performance.now();
+  const drivePostProcessing = !isMobileDevice && isDriveMode();
+  gtao.enabled = !isMobileDevice && !isRunnerMode();
+  driveBloom.enabled = drivePostProcessing;
+  gradePass.uniforms.grain.value = drivePostProcessing ? 0.007 : 0.022;
   // Long-course coordinates eventually exceed the stable depth range of the
   // GTAO post target. Race Mode uses the native ACES/PBR path for a pristine,
-  // fast image; the contained Free Mode still keeps desktop GTAO and grain.
-  if (isMobileDevice || isRunnerMode()) renderer.render(scene, camera);
+  // fast image. Drive uses bloom without GTAO; Free keeps GTAO and film grain.
+  if (isMobileDevice || (isRunnerMode() && !drivePostProcessing)) renderer.render(scene, camera);
   else composer.render(dt);
 }
 
@@ -2815,9 +2846,10 @@ window.render_game_to_text = () => {
       antialiasSamples: isMobileDevice ? 0 : 4,
       shadowMap: isMobileDevice ? 1024 : 2048,
       reflectionMap: isDriveMode()
-        ? (driveMode.state.phase === 'city' ? 0 : (isMobileDevice ? 256 : 512))
+        ? (driveMode.state.phase.startsWith('canal') ? (isMobileDevice ? 256 : 512) : 0)
         : (isMobileDevice ? 384 : 768),
-      postProcessing: !isMobileDevice && !isRunnerMode(),
+      postProcessing: !isMobileDevice && (!isRunnerMode() || isDriveMode()),
+      bloomEnabled: !isMobileDevice && isDriveMode(),
       gtaoEnabled: gtao.enabled && !isRunnerMode(),
       gtaoSamples: gtao.enabled && !isRunnerMode() ? gtaoSamples : 0,
     },
@@ -2840,6 +2872,9 @@ window.render_game_to_text = () => {
           surface: driveMode.state.surface,
           road: 'clearcoated procedural wet asphalt with neon lane reflections',
           canal: 'official Three.js Water planar reflections with procedural normals and pooled water gameplay',
+          desert: 'pooled procedural rose-sand mesas, layered rock spires, road-wide natural arches, saguaros, shrubs, tumbleweeds, and neon deco signs',
+          bridge: `elevated three-lane ${driveMode.state.bridgeVariant} skybridge with sampled climb, span, and descent geometry`,
+          roadside: 'pooled streetlights, overhead sign gantries, side highway signs, and wet-road light smears',
           terrain: 'camera-centered ImprovedNoise FBM mesh',
           city: 'recycled cyber towers plus pooled Art Deco hotels, condos, nightclubs, billboards, palms, and bushes',
           curvature: 'shared view-space parabolic vertex bend on road and canal scenery; mathematically flat reflective water plane',
@@ -2848,7 +2883,7 @@ window.render_game_to_text = () => {
         ? { playerMaterial: 'rigid texture-free procedural PBR marble', sky: 'procedural stars and magenta nebula', terrain: 'ImprovedNoise track-following canyon', monuments: '7 colossal arches plus 14 concrete and glossy-metal walls', moon: 'synthetic cyan' }
         : { playerMaterial: 'rigid texture-free procedural PBR marble', sky: 'procedural Preetham', sunElevation: skySettings.elevation, water: 'planar reflective', waves: 'three small geometric wave bands, max amplitude 0.046' }),
     landmarks: isDriveMode()
-      ? ['three fixed neon road and canal lanes', 'striped synthetic sun', 'entry and exit transformation ramps', 'reflective turquoise tideway', 'endless cyber towers and Art Deco waterfront', 'leaning canal palms and neon billboards']
+      ? ['three fixed neon road and canal lanes', 'striped synthetic sun with magenta bloom halo', 'pooled streetlights and overhead highway sign gantries', 'entry and exit transformation ramps', 'reflective turquoise tideway', 'procedural desert rock arches and saguaros', 'elevated lake, river, and dry-land skybridges', 'endless cyber towers and Art Deco waterfront']
       : (isRaceMode()
         ? [`start elevation ${raceTrackSamples[0].center.y.toFixed(0)}`, `${RACE_CHECKPOINT_DISTANCES.length} checkpoints divide ${COURSE_SECTIONS.length} paced sections`, `finish elevation ${raceTrackSamples.at(-1).center.y.toFixed(0)}`, `6500-unit banked half-pipe with strong S-turns and ${TRACK_LOOPS.length} complete vertical loops`, 'procedural canyon and seven monumental arches']
         : ['gold arch at (0, -5)', 'rose/coral stairs near (-7, -5)', 'coral arch at (7, -12)']),

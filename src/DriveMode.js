@@ -4,18 +4,58 @@ import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { DriveVisualGains } from './DriveVisualGains.js';
 import { DriveCanalSection } from './DriveCanalSection.js';
+import { DriveDesertSection } from './DriveDesertSection.js';
+import { DriveBridgeSection } from './DriveBridgeSection.js';
+import { DriveRoadsideProps } from './DriveRoadsideProps.js';
 
 const DRIVE_ORIGIN_X = -1000;
 const ROAD_NEAR_Z = 18;
 const ROAD_FAR_Z = -300;
 const CAR_Z = 4;
 const LANE_X = [-3.25, 0, 3.25];
-const DRIVE_CYCLE_LENGTH = 1100;
+const DRIVE_CYCLE_LENGTH = 2400;
 const CANAL_APPROACH_START = 250;
 const CANAL_ENTRY_START = 300;
 const CANAL_RUN_START = 345;
 const CANAL_EXIT_START = 820;
 const CANAL_RETURN_START = 865;
+const DESERT_APPROACH_START = 1050;
+const DESERT_RUN_START = 1120;
+const BRIDGE_CLIMB_START = 1600;
+const BRIDGE_SPAN_START = 1710;
+const BRIDGE_DESCENT_START = 2040;
+const BRIDGE_RETURN_START = 2150;
+const CITY_RETURN_START = 2280;
+const BRIDGE_PROFILE_WORLD_LENGTH = 300;
+const CANAL_PHASES = new Set(['canal-approach', 'canal-entry', 'canal', 'canal-exit']);
+const DESERT_PHASES = new Set(['desert-approach', 'desert', 'desert-return']);
+const BRIDGE_PHASES = new Set(['bridge-climb', 'bridge-span', 'bridge-descent']);
+const ROAD_COLLISION_PHASES = new Set(['city', 'desert', 'desert-return']);
+const ROADSIDE_PHASES = new Set(['city', 'canal-approach', 'desert-approach', 'desert', 'desert-return']);
+
+function smootherStep01(value) {
+  const t = THREE.MathUtils.clamp(value, 0, 1);
+  return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+function bridgeElevationAtProgress(progress, variant = 'lake') {
+  if (progress <= 0 || progress >= 1) return 0;
+  const rise = smootherStep01(progress / 0.235);
+  const descent = smootherStep01((1 - progress) / 0.235);
+  const highSpan = Math.min(rise, descent);
+  const crown = Math.pow(Math.sin(progress * Math.PI), 2);
+  const baseHeight = variant === 'desert' ? 12.2 : 13.8;
+  return highSpan * (baseHeight + crown * 1.65);
+}
+
+function bridgeGradeAtProgress(progress, variant = 'lake') {
+  const epsilon = 0.0015;
+  const slope = (
+    bridgeElevationAtProgress(progress + epsilon, variant)
+    - bridgeElevationAtProgress(progress - epsilon, variant)
+  ) / (epsilon * BRIDGE_PROFILE_WORLD_LENGTH * 2);
+  return Math.atan(slope);
+}
 
 function driveSectionAtDistance(distance) {
   const cycleIndex = Math.max(0, Math.floor(distance / DRIVE_CYCLE_LENGTH));
@@ -26,6 +66,8 @@ function driveSectionAtDistance(distance) {
   let end = CANAL_APPROACH_START;
   let vehicle = 'car';
   let surface = 'road';
+  let biome = 'city';
+  const bridgeVariant = ['lake', 'river', 'desert'][cycleIndex % 3];
 
   if (cycleDistance >= CANAL_APPROACH_START && cycleDistance < CANAL_ENTRY_START) {
     phase = 'canal-approach';
@@ -55,17 +97,85 @@ function driveSectionAtDistance(distance) {
     surface = 'air';
   } else if (cycleDistance >= CANAL_RETURN_START) {
     start = CANAL_RETURN_START;
+    end = DESERT_APPROACH_START;
+  }
+
+  if (CANAL_PHASES.has(phase)) {
+    biome = 'canal';
+  }
+
+  if (cycleDistance >= DESERT_APPROACH_START && cycleDistance < DESERT_RUN_START) {
+    phase = 'desert-approach';
+    label = 'SONORAN LINK';
+    start = DESERT_APPROACH_START;
+    end = DESERT_RUN_START;
+    biome = 'desert';
+  } else if (cycleDistance >= DESERT_RUN_START && cycleDistance < BRIDGE_CLIMB_START) {
+    phase = 'desert';
+    label = 'MAGENTA BADLANDS';
+    start = DESERT_RUN_START;
+    end = BRIDGE_CLIMB_START;
+    biome = 'desert';
+  } else if (cycleDistance >= BRIDGE_CLIMB_START && cycleDistance < BRIDGE_SPAN_START) {
+    phase = 'bridge-climb';
+    label = 'SKYBRIDGE ASCENT';
+    start = BRIDGE_CLIMB_START;
+    end = BRIDGE_SPAN_START;
+    biome = 'bridge';
+  } else if (cycleDistance >= BRIDGE_SPAN_START && cycleDistance < BRIDGE_DESCENT_START) {
+    phase = 'bridge-span';
+    label = bridgeVariant === 'desert'
+      ? 'FLOATING BADLAND SPAN'
+      : (bridgeVariant === 'river' ? 'NEON RIVER SPAN' : 'MIRROR LAKE SPAN');
+    start = BRIDGE_SPAN_START;
+    end = BRIDGE_DESCENT_START;
+    biome = 'bridge';
+  } else if (cycleDistance >= BRIDGE_DESCENT_START && cycleDistance < BRIDGE_RETURN_START) {
+    phase = 'bridge-descent';
+    label = 'SKYBRIDGE DESCENT';
+    start = BRIDGE_DESCENT_START;
+    end = BRIDGE_RETURN_START;
+    biome = 'bridge';
+  } else if (cycleDistance >= BRIDGE_RETURN_START && cycleDistance < CITY_RETURN_START) {
+    phase = 'desert-return';
+    label = 'DESERT CAUSEWAY';
+    start = BRIDGE_RETURN_START;
+    end = CITY_RETURN_START;
+    biome = 'desert';
+  } else if (cycleDistance >= CITY_RETURN_START) {
+    start = CITY_RETURN_START;
     end = DRIVE_CYCLE_LENGTH;
   }
 
+  const progress = THREE.MathUtils.clamp((cycleDistance - start) / Math.max(1, end - start), 0, 1);
+  const bridgeProgress = BRIDGE_PHASES.has(phase)
+    ? THREE.MathUtils.clamp(
+      (cycleDistance - BRIDGE_CLIMB_START) / (BRIDGE_RETURN_START - BRIDGE_CLIMB_START),
+      0,
+      1,
+    )
+    : (cycleDistance >= BRIDGE_RETURN_START ? 1 : 0);
+  const collisionProfile = ROAD_COLLISION_PHASES.has(phase)
+    ? 'road'
+    : (phase === 'canal' ? 'water' : 'none');
   return {
     phase,
     label,
     vehicle,
     surface,
+    biome,
+    bridgeVariant,
+    bridgeProgress,
+    roadElevation: BRIDGE_PHASES.has(phase)
+      ? bridgeElevationAtProgress(bridgeProgress, bridgeVariant)
+      : 0,
+    roadGrade: BRIDGE_PHASES.has(phase)
+      ? bridgeGradeAtProgress(bridgeProgress, bridgeVariant)
+      : 0,
+    collisionProfile,
     cycleIndex,
     cycleDistance,
-    progress: THREE.MathUtils.clamp((cycleDistance - start) / Math.max(1, end - start), 0, 1),
+    progress,
     start,
     end,
   };
@@ -116,6 +226,12 @@ export class DriveMode {
       vehicle: 'car',
       surface: 'road',
       airborne: false,
+      biome: 'city',
+      roadElevation: 0,
+      roadGrade: 0,
+      bridgeVariant: 'lake',
+      bridgeProgress: 0,
+      collisionProfile: 'road',
     };
     this.bendUniforms = {
       uDriveTime: { value: 0 },
@@ -125,6 +241,7 @@ export class DriveMode {
       uBendX: { value: 0.00018 },
       uBendY: { value: 0.00128 },
       uDriveOriginX: { value: DRIVE_ORIGIN_X },
+      uDesertMix: { value: 0 },
     };
     this.motionPhase = { shard: 0 };
     this.shardPhaseTween = gsap.to(this.motionPhase, {
@@ -151,6 +268,21 @@ export class DriveMode {
       patchMaterial: (material, key, style) => this.patchBend(material, key, style),
       onCollect: (event) => this.handleCanalCollect(event),
       onCrash: (event) => this.handleCanalCrash(event),
+      prefersReducedMotion: this.prefersReducedMotion,
+    });
+    this.desertSection = new DriveDesertSection(this.root, {
+      isMobile: this.isMobile,
+      patchMaterial: (material, key, style) => this.patchBend(material, key, style),
+      prefersReducedMotion: this.prefersReducedMotion,
+    });
+    this.bridgeSection = new DriveBridgeSection(this.root, {
+      isMobile: this.isMobile,
+      patchMaterial: (material, key, style) => this.patchBend(material, key, style),
+      prefersReducedMotion: this.prefersReducedMotion,
+    });
+    this.roadsideProps = new DriveRoadsideProps(this.root, {
+      isMobile: this.isMobile,
+      patchMaterial: (material, key, style) => this.patchBend(material, key, style),
       prefersReducedMotion: this.prefersReducedMotion,
     });
     this.boatRig = this.canalSection.boatRig;
@@ -214,6 +346,7 @@ export class DriveMode {
         uniform float uDriveTime;
         uniform float uDriveTravel;
         uniform float uDriveOriginX;
+        uniform float uDesertMix;
         varying vec3 vDriveWorldPosition;
         varying vec2 vDriveUv;`,
       );
@@ -240,6 +373,15 @@ export class DriveMode {
             float wetPulse = 0.15 + 0.85 * pow(0.5 + 0.5 * sin(driveRoadZ * 0.075), 8.0);
             float cyanReflection = exp(-abs(driveRoadX + 4.75) * 1.12) * wetPulse;
             float pinkReflection = exp(-abs(driveRoadX - 4.75) * 1.12) * wetPulse;
+            float cyanFacade = exp(-abs(driveRoadX + 3.95) * 0.68) + exp(-abs(driveRoadX + 1.3) * 1.32) * 0.42;
+            float pinkFacade = exp(-abs(driveRoadX - 3.95) * 0.68) + exp(-abs(driveRoadX - 1.3) * 1.32) * 0.42;
+            float skylineSmear = 0.12 + 0.88 * pow(0.5 + 0.5 * sin(driveRoadZ * 0.034 + floor(abs(driveRoadX) * 0.74) * 1.9), 9.0);
+            float windowGlint = pow(0.5 + 0.5 * sin(driveRoadZ * 0.43 + driveRoadX * 3.7), 24.0);
+            float cityWetness = (0.2 + puddle * 0.92) * (1.0 - uDesertMix);
+            float cityReflectionCyan = clamp(cyanFacade * (skylineSmear + windowGlint * 0.44), 0.0, 1.0) * cityWetness;
+            float cityReflectionPink = clamp(pinkFacade * (skylineSmear + windowGlint * 0.44), 0.0, 1.0) * cityWetness;
+            float lampCadence = pow(0.5 + 0.5 * cos(driveRoadZ * 0.145), 38.0);
+            float lampReflection = lampCadence * exp(-abs(abs(driveRoadX) - 4.6) * 0.72) * (0.36 + puddle * 0.8);
             vec3 asphalt = mix(vec3(0.004, 0.006, 0.013), vec3(0.018, 0.03, 0.052), puddle);
             asphalt *= 0.78 + microGrit * 0.26;
             asphalt += tireWear * vec3(0.005, 0.008, 0.014) + rainRill * vec3(0.002, 0.008, 0.014);
@@ -248,24 +390,30 @@ export class DriveMode {
             diffuseColor.rgb += edgeLine * vec3(1.0, 0.02, 0.47) * 0.62;
             diffuseColor.rgb += cyanReflection * vec3(0.0, 0.34, 0.48) * (0.18 + puddle * 0.5);
             diffuseColor.rgb += pinkReflection * vec3(0.48, 0.0, 0.22) * (0.18 + puddle * 0.5);
+            diffuseColor.rgb += cityReflectionCyan * vec3(0.01, 0.3, 0.48) + cityReflectionPink * vec3(0.52, 0.01, 0.28);
+            diffuseColor.rgb += lampReflection * vec3(0.46, 0.34, 0.16);
             diffuseColor.rgb += neonStreak * mix(vec3(0.0, 0.72, 1.0), vec3(1.0, 0.0, 0.48), step(0.0, driveRoadX));`,
           )
           .replace(
             '#include <roughnessmap_fragment>',
             `#include <roughnessmap_fragment>
-            roughnessFactor = clamp(mix(0.48, 0.055, puddle) + (microGrit - 0.5) * 0.11 - rainRill * 0.08, 0.045, 0.58);`,
+            roughnessFactor = clamp(mix(0.35, 0.035, puddle) + (microGrit - 0.5) * 0.085 - rainRill * 0.07, 0.028, 0.48);`,
           )
           .replace(
             '#include <emissivemap_fragment>',
             `#include <emissivemap_fragment>
             totalEmissiveRadiance += marker * vec3(0.02, 0.32, 0.58) + edgeLine * vec3(0.72, 0.0, 0.2) + neonStreak * vec3(0.14, 0.015, 0.25);
-            totalEmissiveRadiance += cyanReflection * vec3(0.0, 0.18, 0.28) + pinkReflection * vec3(0.25, 0.0, 0.12);`,
+            totalEmissiveRadiance += cyanReflection * vec3(0.0, 0.18, 0.28) + pinkReflection * vec3(0.25, 0.0, 0.12);
+            totalEmissiveRadiance += cityReflectionCyan * vec3(0.0, 0.22, 0.36) + cityReflectionPink * vec3(0.4, 0.0, 0.2);
+            totalEmissiveRadiance += lampReflection * vec3(0.34, 0.22, 0.06);`,
           )
           .replace(
             '#include <opaque_fragment>',
             `outgoingLight *= 0.26;
             outgoingLight += marker * vec3(0.03, 0.42, 0.72) + edgeLine * vec3(0.82, 0.0, 0.24);
             outgoingLight += cyanReflection * vec3(0.0, 0.17, 0.28) + pinkReflection * vec3(0.24, 0.0, 0.12);
+            outgoingLight += cityReflectionCyan * vec3(0.0, 0.2, 0.34) + cityReflectionPink * vec3(0.38, 0.0, 0.19);
+            outgoingLight += lampReflection * vec3(0.38, 0.25, 0.07);
             #include <opaque_fragment>`,
           );
       } else if (style === 'building') {
@@ -276,7 +424,10 @@ export class DriveMode {
             vec2 driveWindowCell = fract(vDriveUv * vec2(6.0, 17.0));
             float driveWindowX = step(0.18, driveWindowCell.x) * step(driveWindowCell.x, 0.74);
             float driveWindowY = step(0.2, driveWindowCell.y) * step(driveWindowCell.y, 0.68);
-            float driveWindows = driveWindowX * driveWindowY * step(1.0, vDriveWorldPosition.y);`,
+            vec2 driveWindowId = floor(vDriveUv * vec2(6.0, 17.0));
+            float driveWindowSeed = fract(sin(dot(driveWindowId + floor(vDriveWorldPosition.xz * 0.12), vec2(19.19, 73.31))) * 43758.5453);
+            float driveWindows = driveWindowX * driveWindowY * step(1.0, vDriveWorldPosition.y) * step(0.57, driveWindowSeed);
+            diffuseColor.rgb *= mix(0.32, 0.46, driveWindows);`,
           )
           .replace(
             '#include <emissivemap_fragment>',
@@ -293,27 +444,39 @@ export class DriveMode {
         );
       }
     };
-    material.customProgramCacheKey = () => `game-dream-drive-${key}-v4`;
+    material.customProgramCacheKey = () => `game-dream-drive-${key}-v6`;
     return material;
   }
 
   createSky() {
+    this.skyDesertMix = this.bendUniforms.uDesertMix;
     const skyMaterial = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
-      uniforms: { time: this.bendUniforms.uDriveTime },
+      uniforms: {
+        time: this.bendUniforms.uDriveTime,
+        desertMix: this.skyDesertMix,
+      },
       vertexShader: `varying vec3 vSkyDirection; void main(){ vSkyDirection=normalize(position); gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
       fragmentShader: `
         varying vec3 vSkyDirection;
         uniform float time;
+        uniform float desertMix;
         float hash(vec3 p){ return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453); }
         void main(){
           vec3 d=normalize(vSkyDirection);
           float horizon=pow(clamp(1.0-abs(d.y+0.08),0.0,1.0),5.0);
           float stars=step(0.994,hash(floor(d*520.0)))*smoothstep(-0.05,0.25,d.y);
-          vec3 color=mix(vec3(0.002,0.004,0.018),vec3(0.025,0.012,0.09),max(d.y,0.0));
-          color+=horizon*vec3(0.22,0.0,0.19);
-          color+=stars*mix(vec3(0.1,0.8,1.0),vec3(1.0,0.1,0.5),hash(floor(d*311.0)))*2.4;
+          vec3 color=mix(vec3(0.001,0.002,0.012),vec3(0.05,0.012,0.13),max(d.y,0.0));
+          color+=horizon*vec3(0.48,0.018,0.4);
+          color+=stars*mix(vec3(0.1,0.8,1.0),vec3(1.0,0.1,0.5),hash(floor(d*311.0)))*2.4*(1.0-desertMix);
+          float desertHeight=clamp(d.y*0.72+0.38,0.0,1.0);
+          vec3 desertColor=mix(vec3(0.62,0.045,0.28),vec3(0.22,0.085,0.38),desertHeight);
+          desertColor+=horizon*vec3(0.9,0.12,0.32);
+          float cloudNoise=sin(d.x*18.0+d.z*9.0+sin(d.z*13.0)*1.7);
+          float cloudBand=smoothstep(0.44,0.9,cloudNoise)*smoothstep(0.06,0.34,d.y)*(1.0-smoothstep(0.58,0.82,d.y));
+          desertColor+=cloudBand*vec3(0.75,0.16,0.42)*0.48;
+          color=mix(color,desertColor,desertMix);
           gl_FragColor=vec4(color,1.0);
         }`,
     });
@@ -321,10 +484,35 @@ export class DriveMode {
     this.sky.renderOrder = -20;
     this.root.add(this.sky);
 
-    const sunMaterial = new THREE.MeshBasicMaterial({ color: '#ff287f', fog: false });
+    const haloMaterial = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+      vertexShader: 'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+      fragmentShader: `
+        varying vec2 vUv;
+        void main() {
+          float radius = length((vUv - 0.5) * 2.0);
+          float core = 1.0 - smoothstep(0.04, 0.98, radius);
+          float halo = pow(core, 2.2) * 0.58;
+          vec3 color = mix(vec3(0.28, 0.025, 0.48), vec3(0.9, 0.025, 0.42), core);
+          gl_FragColor = vec4(color * halo * 0.58, halo * 0.58);
+        }
+      `,
+    });
+    this.sunHalo = new THREE.Mesh(new THREE.PlaneGeometry(92, 92), haloMaterial);
+    this.sunHalo.position.set(0, 28, -205.3);
+    this.root.add(this.sunHalo);
+
+    const sunMaterial = new THREE.MeshBasicMaterial({ color: '#ffd06e', fog: false });
     this.sunDisc = new THREE.Mesh(new THREE.CircleGeometry(23, 64), sunMaterial);
     this.sunDisc.position.set(0, 28, -205);
     this.root.add(this.sunDisc);
+    this.skyBiomeTo = gsap.quickTo(this.skyDesertMix, 'value', {
+      duration: this.prefersReducedMotion() ? 0.08 : 1.1,
+      ease: 'power2.inOut',
+    });
     const barMaterial = new THREE.MeshBasicMaterial({ color: '#18051f', fog: false });
     for (let i = 0; i < 6; i++) {
       const bar = new THREE.Mesh(new THREE.PlaneGeometry(49, 1.05 + i * 0.11), barMaterial);
@@ -338,9 +526,9 @@ export class DriveMode {
     this.roadEnvironment.name = 'Drive road deck and neon edges';
     this.root.add(this.roadEnvironment);
     const roadMaterial = this.patchBend(new THREE.MeshPhysicalMaterial({
-      color: '#02040a', roughness: 0.26, metalness: 0.08,
-      clearcoat: 1, clearcoatRoughness: 0.055, envMapIntensity: 0.58,
-      specularIntensity: 0.9, ior: 1.42,
+      color: '#010207', roughness: 0.2, metalness: 0.12,
+      clearcoat: 1, clearcoatRoughness: 0.035, envMapIntensity: 0.72,
+      specularIntensity: 1, ior: 1.46,
     }), 'wet-road', 'road');
     const roadGeometry = new THREE.BoxGeometry(12, 0.24, 320, 1, 1, this.isMobile ? 80 : 144);
     this.road = new THREE.Mesh(roadGeometry, roadMaterial);
@@ -561,13 +749,15 @@ export class DriveMode {
     this.carImpactRig.add(this.carVisualRig);
 
     const paint = new THREE.MeshPhysicalMaterial({
-      color: '#09071d', metalness: 0.46, roughness: 0.24,
-      clearcoat: 0.82, clearcoatRoughness: 0.1, envMapIntensity: 0.09,
+      color: '#020106', metalness: 0.62, roughness: 0.2,
+      clearcoat: 0.9, clearcoatRoughness: 0.075, envMapIntensity: 0.045,
+      specularIntensity: 0.42, ior: 1.32,
       iridescence: 0.42, iridescenceIOR: 1.8,
     });
     const glass = new THREE.MeshPhysicalMaterial({
-      color: '#061724', metalness: 0.2, roughness: 0.08,
-      clearcoat: 1, clearcoatRoughness: 0.04, envMapIntensity: 0.28,
+      color: '#000103', metalness: 0.05, roughness: 0.16,
+      clearcoat: 0.68, clearcoatRoughness: 0.08, envMapIntensity: 0.015,
+      specularIntensity: 0.1, ior: 1.18,
     });
     const tire = new THREE.MeshStandardMaterial({ color: '#030307', roughness: 0.72, metalness: 0.15 });
     const cyan = new THREE.MeshBasicMaterial({ color: '#20e8ff', toneMapped: false });
@@ -870,16 +1060,18 @@ export class DriveMode {
   }
 
   createLights() {
-    this.root.add(new THREE.HemisphereLight('#242c62', '#07020d', 0.72));
-    const cyanLight = new THREE.PointLight('#19dfff', 18, 22, 2);
+    this.root.add(new THREE.HemisphereLight('#2a2358', '#010105', 0.22));
+    const cyanLight = new THREE.PointLight('#19dfff', 5.2, 18, 2);
     cyanLight.position.set(-5, 3.5, 7);
-    const magentaLight = new THREE.PointLight('#ff127f', 24, 26, 2);
+    const magentaLight = new THREE.PointLight('#ff127f', 6.4, 20, 2);
     magentaLight.position.set(5, 3.2, 4);
     this.root.add(cyanLight, magentaLight);
   }
 
   applySectionState(section, { emit = false } = {}) {
     const previousPhase = this.state.phase;
+    const previousBiome = this.state.biome;
+    const previousBridgeVariant = this.state.bridgeVariant;
     Object.assign(this.state, {
       phase: section.phase,
       sectionLabel: section.label,
@@ -889,10 +1081,27 @@ export class DriveMode {
       vehicle: section.vehicle,
       surface: section.surface,
       airborne: section.surface === 'air',
+      biome: section.biome,
+      roadElevation: section.roadElevation,
+      roadGrade: section.roadGrade,
+      bridgeVariant: section.bridgeVariant,
+      bridgeProgress: section.bridgeProgress,
+      collisionProfile: section.collisionProfile,
     });
+    this.car.position.y = 0.06 + section.roadElevation;
+    // The coupe faces local -Z, so a positive X rotation raises its nose to
+    // match a positive forward bridge grade.
+    this.car.rotation.x = section.roadGrade;
 
+    const canalVisible = CANAL_PHASES.has(section.phase);
+    const desertVisible = DESERT_PHASES.has(section.phase);
+    const bridgeVisible = BRIDGE_PHASES.has(section.phase);
     const exitRoadVisible = section.phase === 'canal-exit' && section.progress >= 0.44;
     const roadVisible = section.phase === 'city'
+      || section.phase === 'canal-approach'
+      || exitRoadVisible
+      || desertVisible;
+    const cityVisible = section.phase === 'city'
       || section.phase === 'canal-approach'
       || exitRoadVisible;
     if (previousPhase === 'city' && section.phase === 'canal-approach') {
@@ -906,14 +1115,40 @@ export class DriveMode {
         this.recycleRunnerObject(object, -42 - index * 19);
       });
     }
+    if (desertVisible && !DESERT_PHASES.has(previousPhase)) {
+      this.desertSection.reset();
+    }
+    if (bridgeVisible && (!BRIDGE_PHASES.has(previousPhase)
+      || previousBridgeVariant !== section.bridgeVariant)) {
+      this.bridgeSection.reset({ variant: section.bridgeVariant });
+    }
+    if (previousPhase === 'bridge-descent' && section.phase === 'desert-return') {
+      this.runnerObjects.forEach((object, index) => {
+        this.recycleRunnerObject(object, -42 - index * 19);
+      });
+    }
     this.roadEnvironment.visible = roadVisible;
-    this.terrainGroup.visible = roadVisible;
-    this.cityGroup.visible = roadVisible;
-    this.runnerGroup.visible = section.phase === 'city';
-    this.canalSection.setActive(section.phase !== 'city');
+    this.terrainGroup.visible = cityVisible;
+    this.cityGroup.visible = cityVisible;
+    this.runnerGroup.visible = section.collisionProfile === 'road';
+    this.canalSection.setActive(canalVisible);
+    this.desertSection.setActive(desertVisible);
+    this.bridgeSection.setActive(bridgeVisible);
+    this.roadsideProps.setActive(ROADSIDE_PHASES.has(section.phase));
+    if (bridgeVisible && !emit) {
+      this.bridgeSection.update(0, {
+        active: false,
+        sectionProgress: section.bridgeProgress,
+        phase: section.phase,
+        cycleIndex: section.cycleIndex,
+      });
+    }
     this.updateTransitionRamps(section);
     this.syncVehiclePose(section);
     this.visualGains?.setSurface?.(section.surface);
+    const skyTarget = section.biome === 'desert' ? 1 : (section.biome === 'bridge' ? 0.78 : 0);
+    if (!emit) this.skyDesertMix.value = skyTarget;
+    else if (previousBiome !== section.biome) this.skyBiomeTo?.(skyTarget);
 
     if (emit && previousPhase !== section.phase) {
       const eventByPhase = {
@@ -921,7 +1156,15 @@ export class DriveMode {
         'canal-entry': 'entry-takeoff',
         canal: 'boat-deployed',
         'canal-exit': 'exit-takeoff',
-        city: previousPhase === 'canal-exit' ? 'car-restored' : 'city-loop',
+        'desert-approach': 'desert-ahead',
+        desert: 'desert-entered',
+        'bridge-climb': 'bridge-climb',
+        'bridge-span': 'bridge-span',
+        'bridge-descent': 'bridge-descent',
+        'desert-return': 'desert-returned',
+        city: previousPhase === 'canal-exit'
+          ? 'car-restored'
+          : (previousPhase === 'desert-return' ? 'city-returned' : 'city-loop'),
       };
       this.onSectionChange({
         event: eventByPhase[section.phase],
@@ -947,8 +1190,14 @@ export class DriveMode {
       vehicle: startSection.vehicle,
       surface: startSection.surface,
       airborne: startSection.surface === 'air',
+      biome: startSection.biome,
+      roadElevation: startSection.roadElevation,
+      roadGrade: startSection.roadGrade,
+      bridgeVariant: startSection.bridgeVariant,
+      bridgeProgress: startSection.bridgeProgress,
+      collisionProfile: startSection.collisionProfile,
     });
-    this.car.position.set(0, 0.06, CAR_Z);
+    this.car.position.set(0, 0.06 + startSection.roadElevation, CAR_Z);
     this.car.rotation.set(0, 0, 0);
     this.laneTimeline?.kill();
     this.impactTimeline?.kill();
@@ -971,6 +1220,9 @@ export class DriveMode {
     this.underglow.material.opacity = 0.26;
     this.visualGains?.reset();
     this.canalSection.reset();
+    this.desertSection.reset();
+    this.bridgeSection.reset({ variant: startSection.bridgeVariant });
+    this.roadsideProps.reset({ biome: startSection.biome });
     this.carIdleTimeline.restart();
     this.carIdleTimeline.paused(!this.root.visible);
     this.buildings.forEach((building, index) => this.recycleBuilding(building, -18 - index * (this.isMobile ? 10 : 7.2)));
@@ -979,12 +1231,24 @@ export class DriveMode {
     this.bendUniforms.uBendX.value = 0.00018;
     this.updateTerrain(true);
     this.applySectionState(startSection);
+    if (DESERT_PHASES.has(startSection.phase)) {
+      const desertSegmentStart = startSection.phase === 'desert-return'
+        ? BRIDGE_RETURN_START
+        : DESERT_APPROACH_START;
+      this.desertSection.update(0, {
+        advance: Math.max(0, startSection.cycleDistance - desertSegmentStart),
+        active: true,
+      });
+    }
   }
 
   setVisible(visible) {
     this.root.visible = visible;
     this.carIdleTimeline?.paused(!visible);
-    this.canalSection?.setActive(Boolean(visible && this.state.phase !== 'city'));
+    this.canalSection?.setActive(Boolean(visible && CANAL_PHASES.has(this.state.phase)));
+    this.desertSection?.setActive(Boolean(visible && DESERT_PHASES.has(this.state.phase)));
+    this.bridgeSection?.setActive(Boolean(visible && BRIDGE_PHASES.has(this.state.phase)));
+    this.roadsideProps?.setActive(Boolean(visible && ROADSIDE_PHASES.has(this.state.phase)));
   }
 
   shiftLane(direction) {
@@ -1086,6 +1350,20 @@ export class DriveMode {
     this.terrainAccumulator += dt;
     if (!active || this.state.crashed) {
       this.canalSection.update(dt, { active: false });
+      this.desertSection.update(dt, { active: false });
+      this.bridgeSection.update(dt, {
+        active: false,
+        sectionProgress: this.state.bridgeProgress,
+        phase: this.state.phase,
+        cycleIndex: this.state.cycleIndex,
+      });
+      this.roadsideProps.update(dt, {
+        active: false,
+        biome: this.state.biome,
+        roadElevation: this.state.roadElevation,
+        roadGrade: this.state.roadGrade,
+        onBridge: false,
+      });
       this.visualGains?.update(this.state, false);
       return;
     }
@@ -1096,7 +1374,7 @@ export class DriveMode {
     this.state.distance += advance;
     const section = driveSectionAtDistance(this.state.distance);
     this.applySectionState(section, { emit: true });
-    const roadGameplayActive = section.phase === 'city';
+    const roadGameplayActive = section.collisionProfile === 'road';
     const canalGameplayActive = section.phase === 'canal';
     const targetX = LANE_X[this.state.targetLane];
     this.state.lateralX = smoothDamp(this.state.lateralX, targetX, 11.5, dt);
@@ -1157,8 +1435,33 @@ export class DriveMode {
       advance,
       lateralX: this.state.lateralX,
       speed: this.state.speed,
-      active: section.phase !== 'city',
+      active: CANAL_PHASES.has(section.phase),
       collisionsEnabled: canalGameplayActive,
+    });
+    this.desertSection.update(dt, {
+      advance,
+      active: DESERT_PHASES.has(section.phase),
+    });
+    this.bridgeSection.update(dt, {
+      advance,
+      active: BRIDGE_PHASES.has(section.phase),
+      phase: section.phase,
+      sectionProgress: section.bridgeProgress,
+      cycleIndex: section.cycleIndex,
+      variant: section.bridgeVariant,
+      roadElevation: section.roadElevation,
+      roadGrade: section.roadGrade,
+    });
+    this.roadsideProps.update(dt, {
+      advance,
+      active: ROADSIDE_PHASES.has(section.phase),
+      biome: section.biome,
+      roadElevation: section.roadElevation,
+      roadGrade: section.roadGrade,
+      // The bridge already owns profile-sampled road lights and suspension
+      // towers. Roadside furniture stays on the bent common-road biomes so
+      // distant gantries cannot detach from a curved climb.
+      onBridge: false,
     });
     this.state.score = Math.floor(this.state.distance * 2 + this.state.shards * 125);
     if (this.terrainGroup.visible) this.updateTerrain();
@@ -1169,8 +1472,17 @@ export class DriveMode {
     const portrait = this.viewportAspect < 0.78;
     const targetFollow = this.isMobile ? 0.88 : 0.38;
     const cameraFollow = this.isMobile ? 0.98 : 0.82;
-    target.set(DRIVE_ORIGIN_X + this.state.lateralX * targetFollow, portrait ? 1.65 : 1.3, portrait ? -10.7 : -9.5);
-    position.set(DRIVE_ORIGIN_X + this.state.lateralX * cameraFollow, portrait ? 7.25 : 6.4, portrait ? 20.8 : 18.2);
+    const elevation = this.state.roadElevation || 0;
+    target.set(
+      DRIVE_ORIGIN_X + this.state.lateralX * targetFollow,
+      (portrait ? 1.65 : 1.3) + elevation,
+      portrait ? -10.7 : -9.5,
+    );
+    position.set(
+      DRIVE_ORIGIN_X + this.state.lateralX * cameraFollow,
+      (portrait ? 7.25 : 6.4) + elevation,
+      portrait ? 20.8 : 18.2,
+    );
     return { target, position };
   }
 
@@ -1190,6 +1502,7 @@ export class DriveMode {
     if (this.state.phase === 'canal') {
       return this.canalSection.nearbyObjects().map((object) => ({ ...object, surface: 'water' }));
     }
+    if (this.state.collisionProfile !== 'road') return [];
     return this.runnerObjects
       .filter((object) => object.z > -70 && object.z < 16)
       .sort((a, b) => b.z - a.z)
@@ -1226,18 +1539,34 @@ export class DriveMode {
       vehicle: this.state.vehicle,
       surface: this.state.surface,
       airborne: this.state.airborne,
+      biome: this.state.biome,
+      roadElevation: +this.state.roadElevation.toFixed(2),
+      roadGrade: +this.state.roadGrade.toFixed(4),
+      bridgeVariant: this.state.bridgeVariant,
+      bridgeProgress: +this.state.bridgeProgress.toFixed(3),
+      collisionProfile: this.state.collisionProfile,
       transitionMarkers: {
         canalApproach: CANAL_APPROACH_START,
         entryRamp: CANAL_ENTRY_START,
         canalRun: CANAL_RUN_START,
         exitRamp: CANAL_EXIT_START,
         roadReturn: CANAL_RETURN_START,
+        desertApproach: DESERT_APPROACH_START,
+        desertRun: DESERT_RUN_START,
+        bridgeClimb: BRIDGE_CLIMB_START,
+        bridgeSpan: BRIDGE_SPAN_START,
+        bridgeDescent: BRIDGE_DESCENT_START,
+        bridgeReturn: BRIDGE_RETURN_START,
+        cityReturn: CITY_RETURN_START,
       },
       bendX: +this.bendUniforms.uBendX.value.toFixed(6),
       bendY: +this.bendUniforms.uBendY.value.toFixed(6),
       terrain: 'camera-centered ImprovedNoise FBM mesh resampled during travel',
       visualGains: this.visualGains?.snapshot(),
       canal: this.canalSection.snapshot(),
+      desert: this.desertSection.snapshot(),
+      bridge: this.bridgeSection.snapshot(),
+      roadside: this.roadsideProps.snapshot(),
       nearbyObjects: this.nearbyObjects(),
     };
   }
